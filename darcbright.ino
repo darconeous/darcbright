@@ -9,7 +9,7 @@ Notes:
 #include <Wire.h>
 
 // Settings
-#define OVERTEMP                315
+#define OVERTEMP                330
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -35,13 +35,14 @@ Notes:
 #define MODE_POWERUP            0
 #define MODE_OFF                1
 #define MODE_LOW                2
-#define MODE_HIGH               3
-#define MODE_KNOBBING           4
-#define MODE_KNOBBED            5
-#define MODE_BLINKING           6
-#define MODE_BLINKING_PREVIEW   7
-#define MODE_DAZZLING           8
-#define MODE_DAZZLING_PREVIEW   9
+#define MODE_MED                3
+#define MODE_HIGH               4
+#define MODE_KNOBBING           5
+#define MODE_KNOBBED            6
+#define MODE_BLINKING           7
+#define MODE_BLINKING_PREVIEW   8
+#define MODE_DAZZLING           9
+#define MODE_DAZZLING_PREVIEW   10
 
 // State
 byte mode = 0;
@@ -108,8 +109,25 @@ void loop()
   static byte blink;
   unsigned long time = millis();
   
-  // Blink the indicator LED now and then
-  digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
+  // Check the state of the charge controller
+  int chargeState = analogRead(APIN_CHARGE);
+  if (chargeState < 128)  // Low - charging
+  {
+    byte pulse = ((time>>2)&0xFF);
+    pulse = ((pulse * pulse) >> 8);
+    analogWrite(DPIN_GLED, ((time>>2)&0x0100)?0xFF-pulse:pulse);
+    //digitalWrite(DPIN_GLED, (time&0x0100)?LOW:HIGH);
+  }
+  else if (chargeState > 768) // High - charged
+  {
+    analogWrite(DPIN_GLED, 255);
+    digitalWrite(DPIN_GLED, HIGH);
+  }
+  else // Hi-Z - shutdown
+  {
+    // Blink the indicator LED now and then
+    digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
+  }
 
   // Check the serial port
   if (Serial.available())
@@ -145,7 +163,9 @@ void loop()
   {
     lastTempTime = time;
     int temperature = analogRead(APIN_TEMP);
-    Serial.print("Temperature = ");
+    Serial.print("chargeState = ");
+    Serial.print(chargeState);
+    Serial.print(" Temperature = ");
     Serial.println(temperature);
     if (temperature > OVERTEMP)
     {
@@ -182,44 +202,63 @@ void loop()
   // Do whatever this mode does
   switch (mode)
   {
+  case MODE_KNOBBED:
   case MODE_KNOBBING:
     {
+      do {
       if (time-lastTime < 100) break;
       lastTime = time;
       
+      // Avoid spurious readings from taps and shakes.
+      if(tapped || shaked) break;
+
       float angle = readAccelAngleXZ();
       float change = angle - lastKnobAngle;
       lastKnobAngle = angle;
+
+      { // Don't bother updating our brightness reading if our angle isn't good.
+        char acc[3];
+        readAccel(acc);
+        if(acc[0]*acc[0] + acc[2]*acc[2] < 8*8)
+          break;
+      }
+
       if (change >  PI) change -= 2.0*PI;
       if (change < -PI) change += 2.0*PI;
       knob += -change * 40.0;
       if (knob < 0)   knob = 0;
       if (knob > 255) knob = 255;
-
+      } while (0);
       // Make apparent brightness changes linear by squaring the
       // value and dividing back down into range.  This gives us
       // a gamma correction of 2.0, which is close enough.
       byte bright = (long)(knob * knob) >> 8;
       // Avoid ever appearing off in this mode!
       if (bright < 8) bright = 8;
-      analogWrite(DPIN_DRV_EN, bright);
+      static byte actual_bright = 8;
+      if(bright>actual_bright)
+        actual_bright++;
+      if(bright<actual_bright)
+        actual_bright--;
+      analogWrite(DPIN_DRV_EN, actual_bright);
   
-      Serial.print("Ang = ");
-      Serial.print(angle);
-      Serial.print("\tChange = ");
-      Serial.print(change);
-      Serial.print("\tKnob = ");
-      Serial.print(knob);
-      Serial.print("\tBright = ");
-      Serial.println(bright);
+//      Serial.print("Ang = ");
+//      Serial.print(angle);
+//      Serial.print("\tChange = ");
+//      Serial.print(change);
+//      Serial.print("\tKnob = ");
+//      Serial.print(knob);
+//      Serial.print("\tBright = ");
+//      Serial.println(bright);
     }
     break;
   case MODE_BLINKING:
   case MODE_BLINKING_PREVIEW:
-    if (time-lastTime < 250) break;
-    lastTime = time;
+//    if (time-lastTime < 250) break;
+//    lastTime = time;
 
-    blink = !blink;
+    blink = ((time&(255))<64);
+    //!blink;
     digitalWrite(DPIN_DRV_EN, blink);
     break;
   case MODE_DAZZLING:
@@ -243,6 +282,12 @@ void loop()
       newMode = MODE_KNOBBING;
     break;
   case MODE_LOW:
+    if (btnDown && !newBtnDown)  // Button released
+      newMode = MODE_MED;
+    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
+      newMode = MODE_KNOBBING;
+    break;
+  case MODE_MED:
     if (btnDown && !newBtnDown)  // Button released
       newMode = MODE_HIGH;
     if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
@@ -309,6 +354,13 @@ void loop()
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, HIGH);
       digitalWrite(DPIN_DRV_MODE, LOW);
+      analogWrite(DPIN_DRV_EN, 64);
+      break;
+    case MODE_MED:
+      Serial.println("Mode = medium");
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, HIGH);
+      digitalWrite(DPIN_DRV_MODE, LOW);
       analogWrite(DPIN_DRV_EN, 255);
       break;
     case MODE_HIGH:
@@ -323,7 +375,7 @@ void loop()
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, HIGH);
       lastKnobAngle = readAccelAngleXZ();
-      knob = (mode==MODE_OFF) ? 0 : 255;
+      //knob = (mode==MODE_OFF) ? 0 : 255;
       break;
     case MODE_KNOBBED:
       Serial.println("Mode = knobbed");
@@ -379,10 +431,32 @@ void readAccel(char *acc)
   }
 }
 
+/* Returns the median value of the given three parameters */
+char median_char(char a, char b, char c) {
+    if(a<c) {
+        if(b<a) {
+            return a;
+        } else if(c<b) {
+            return c;
+        }
+    } else {
+        if(a<b) {
+            return a;
+        } else if(b<c) {
+            return c;
+        }
+    }
+    return b;
+}
+
+
 float readAccelAngleXZ()
 {
-  char acc[3];
-  readAccel(acc);
-  return atan2(acc[0], acc[2]);
+  static char acc[3][3];
+  static char i;
+  readAccel(acc[i++]);
+  if(i==3)
+    i=0;
+  return atan2(median_char(acc[0][0],acc[1][0],acc[2][0]),median_char(acc[0][2],acc[1][2],acc[2][2]));
 }
 
