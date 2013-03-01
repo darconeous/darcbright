@@ -1,8 +1,17 @@
-/*             Test firmware for HexBright
-
-Notes:
-  Requires Arduino 1.0.1!
-
+/* darcbright - A custom firmware for the Hexbright flashlight.
+** Based on `hexbright4` from https://github.com/hexbright/hexbright-samples
+** Modifications authored by Robert Quattlebaum <darco@deepdarc.com>
+**
+** Added Features:
+**  * Debounce power-on button press.
+**  * Smooth pulsing charging indicator.
+**  * Accelerometer filtering.
+**
+** TODO:
+**  * Make mode transitions happen immediately on button press
+**    instead of button release.
+**  * Figure out how to add a momentary operation mode.
+**  * Add Smooth transitions between brightness levels.
 */
 
 #include <math.h>
@@ -49,17 +58,21 @@ byte mode = 0;
 unsigned long btnTime = 0;
 boolean btnDown = false;
 
-
-void setup()
+void
+setup(void)
 {
   // We just powered on!  That means either we got plugged 
   // into USB, or (more likely) the user is pressing the 
   // power button.  We need to pull up the enable pin of 
   // the regulator very soon so we don't lose power.
+
+  // We don't pull the pin high here quite yet because
+  // we will do that when we transition out of MODE_OFF,
+  // somewhere in the main loop. Delaying this as long
+  // as possible acts like a debounce for accidental button
+  // taps.
   pinMode(DPIN_PWR,      INPUT);
   digitalWrite(DPIN_PWR, LOW);
-//  pinMode(DPIN_PWR,      OUTPUT);
-//  digitalWrite(DPIN_PWR, LOW);
 
   // Initialize GPIO
   pinMode(DPIN_RLED_SW,  INPUT);
@@ -97,12 +110,16 @@ void setup()
   
   btnTime = millis();
   btnDown = digitalRead(DPIN_RLED_SW);
+
+  // We are initially in the "off" state. We will transition
+  // to something else in the main loop.
   mode = MODE_OFF;
 
   Serial.println("Powered up!");
 }
 
-void loop()
+void
+loop(void)
 {
   static unsigned long lastTime, lastTempTime, lastAccTime;
   static float lastKnobAngle, knob;
@@ -111,30 +128,28 @@ void loop()
   
   // Check the state of the charge controller
   int chargeState = analogRead(APIN_CHARGE);
-  if (chargeState < 128)  // Low - charging
-  {
+
+  if (chargeState < 128) {  // Low - charging
+    // Smoothly pulse the green LED over a two-second interval,
+    // as if it were "breathing". This is the charging indication.
     byte pulse = ((time>>2)&0xFF);
     pulse = ((pulse * pulse) >> 8);
     analogWrite(DPIN_GLED, ((time>>2)&0x0100)?0xFF-pulse:pulse);
-    //digitalWrite(DPIN_GLED, (time&0x0100)?LOW:HIGH);
-  }
-  else if (chargeState > 768) // High - charged
-  {
+
+  } else if (chargeState > 768) {  // High - fully charged.
+    // Solid green LED.
     analogWrite(DPIN_GLED, 255);
     digitalWrite(DPIN_GLED, HIGH);
-  }
-  else // Hi-Z - shutdown
-  {
-    // Blink the indicator LED now and then
+
+  } else {  // Hi-Z - Not charging, not pulged in.
+    // Blink the indicator LED now and then.
     digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
   }
 
   // Check the serial port
-  if (Serial.available())
-  {
+  if(Serial.available()) {
     char c = Serial.read();
-    switch (c)
-    {
+    switch(c) {
     case 's':
       {
         int temperature = analogRead(APIN_TEMP);
@@ -159,16 +174,14 @@ void loop()
   }
 
   // Check the temperature sensor
-  if (time-lastTempTime > 1000)
-  {
+  if(time-lastTempTime > 1000) {
     lastTempTime = time;
     int temperature = analogRead(APIN_TEMP);
     Serial.print("chargeState = ");
     Serial.print(chargeState);
     Serial.print(" Temperature = ");
     Serial.println(temperature);
-    if (temperature > OVERTEMP)
-    {
+    if(temperature > OVERTEMP) {
       Serial.println("Overheat shutdown!");
       mode = MODE_OFF;
       digitalWrite(DPIN_DRV_MODE, LOW);
@@ -179,16 +192,14 @@ void loop()
 
   // Check if the accelerometer wants to interrupt
   byte tapped = 0, shaked = 0;
-  if (!digitalRead(DPIN_ACC_INT))
-  {
+  if (!digitalRead(DPIN_ACC_INT)) {
     Wire.beginTransmission(ACC_ADDRESS);
     Wire.write(ACC_REG_TILT);
     Wire.endTransmission(false);       // End, but do not stop!
     Wire.requestFrom(ACC_ADDRESS, 1);  // This one stops.
     byte tilt = Wire.read();
     
-    if (time-lastAccTime > 500)
-    {
+    if (time-lastAccTime > 500) {
       lastAccTime = time;
   
       tapped = !!(tilt & 0x20);
@@ -200,46 +211,45 @@ void loop()
   }
 
   // Do whatever this mode does
-  switch (mode)
-  {
+  switch (mode) {
   case MODE_KNOBBED:
   case MODE_KNOBBING:
     {
-      do {
-      if (time-lastTime < 100) break;
-      lastTime = time;
-      
-      // Avoid spurious readings from taps and shakes.
-      if(tapped || shaked) break;
+      if (time-lastTime > 100 && !tapped) {
+        lastTime = time;
+  
+        float angle = readAccelAngleXZ();
+        float change = angle - lastKnobAngle;
+        lastKnobAngle = angle;
 
-      float angle = readAccelAngleXZ();
-      float change = angle - lastKnobAngle;
-      lastKnobAngle = angle;
-
-      { // Don't bother updating our brightness reading if our angle isn't good.
+        // Don't bother updating our brightness reading if our angle isn't good.
         char acc[3];
         readAccel(acc);
-        if(acc[0]*acc[0] + acc[2]*acc[2] < 8*8)
-          break;
+        if(acc[0]*acc[0] + acc[2]*acc[2] >= 8*8) {
+          if (change >  PI) change -= 2.0*PI;
+          if (change < -PI) change += 2.0*PI;
+          knob += -change * 40.0;
+          if (knob < 0)   knob = 0;
+          if (knob > 255) knob = 255;
+        }
       }
 
-      if (change >  PI) change -= 2.0*PI;
-      if (change < -PI) change += 2.0*PI;
-      knob += -change * 40.0;
-      if (knob < 0)   knob = 0;
-      if (knob > 255) knob = 255;
-      } while (0);
       // Make apparent brightness changes linear by squaring the
       // value and dividing back down into range.  This gives us
       // a gamma correction of 2.0, which is close enough.
       byte bright = (long)(knob * knob) >> 8;
+
       // Avoid ever appearing off in this mode!
       if (bright < 8) bright = 8;
+
       static byte actual_bright = 8;
+
       if(bright>actual_bright)
         actual_bright++;
+
       if(bright<actual_bright)
         actual_bright--;
+
       analogWrite(DPIN_DRV_EN, actual_bright);
   
 //      Serial.print("Ang = ");
@@ -254,11 +264,7 @@ void loop()
     break;
   case MODE_BLINKING:
   case MODE_BLINKING_PREVIEW:
-//    if (time-lastTime < 250) break;
-//    lastTime = time;
-
     blink = ((time&(255))<64);
-    //!blink;
     digitalWrite(DPIN_DRV_EN, blink);
     break;
   case MODE_DAZZLING:
@@ -273,10 +279,9 @@ void loop()
   // Check for mode changes
   byte newMode = mode;
   byte newBtnDown = digitalRead(DPIN_RLED_SW);
-  switch (mode)
-  {
+  switch(mode) {
   case MODE_OFF:
-    if (btnDown && !newBtnDown)  // Button released
+    if (btnDown && !newBtnDown && (time-btnTime)>50)  // Button released
       newMode = MODE_LOW;
     if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
       newMode = MODE_KNOBBING;
