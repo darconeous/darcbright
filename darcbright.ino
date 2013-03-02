@@ -74,6 +74,7 @@ void set_amount(byte amount) {
   amount_current = amount_begin = amount_end = amount;
   amount_fade_duration = 0;
   amount_off = 0;
+  analogWrite(DPIN_DRV_EN,amount_current);
 }
 
 void fade_to_amount(byte amount, unsigned short fade_duration) {
@@ -174,8 +175,8 @@ PT_THREAD(light_pt_func(struct pt *pt))
       digitalWrite(DPIN_PWR, HIGH);
 
       if(!digitalRead(DPIN_DRV_MODE)) {
-        digitalWrite(DPIN_DRV_MODE, HIGH);
         set_amount(amount_current/4);
+        digitalWrite(DPIN_DRV_MODE, HIGH);
       }
       fade_to_amount(255,500);
       break;
@@ -188,12 +189,14 @@ PT_THREAD(light_pt_func(struct pt *pt))
       PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
     } while(!((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
 
-    if(!level) {
-      fade_to_amount(0,500);
+    if(!digitalRead(DPIN_RLED_SW)) {
+      if(!level)
+        fade_to_amount(0,500);
+      continue;
     }
 
-    if(!digitalRead(DPIN_RLED_SW)) {
-      continue;
+    if(!level) {
+      level = 3;
     }
 
     amount_flash = 1;
@@ -218,14 +221,18 @@ PT_THREAD(light_pt_func(struct pt *pt))
 
       lastTime =  millis();
       do {
-        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 60000 || digitalRead(DPIN_RLED_SW)));
+        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 120*1000 || digitalRead(DPIN_RLED_SW)));
         debounceTime = millis();
         PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
-      } while(!((millis()-lastTime) > 60000 || digitalRead(DPIN_RLED_SW)));
+      } while(!((millis()-lastTime) > 120*1000 || digitalRead(DPIN_RLED_SW)));
 
       amount_off = 0;
 
       if(!digitalRead(DPIN_RLED_SW)) {
+        set_amount(0);
+        digitalWrite(DPIN_DRV_MODE, LOW);
+        pinMode(DPIN_PWR, OUTPUT);
+        digitalWrite(DPIN_PWR, LOW);
         level = 0;
       }
     }
