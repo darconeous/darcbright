@@ -61,11 +61,13 @@ unsigned long btnTime = 0;
 boolean btnDown = false;
 boolean overtemp_throttle = false;
 
-struct pt light_pt;
 struct pt fade_control_pt;
-struct pt light_momentary_pt;
 struct pt power_pt;
+
+struct pt light_pt;
+struct pt light_momentary_pt;
 struct pt light_blinky_pt;
+struct pt light_knob_pt;
 
 
 
@@ -236,6 +238,59 @@ PT_THREAD(light_blinky_pt_func(struct pt *pt))
   } while(amount_current && (button_pressed_duration<10));
 
   amount_off = 0;
+  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
+
+  PT_END(pt);
+}
+
+PT_THREAD(light_knob_pt_func(struct pt *pt))
+{
+  unsigned long time = millis();
+  static unsigned long lastTime;
+  static float lastKnobAngle, knob;
+
+#define PT_WAIT_FOR_PERIOD(pt,x) \
+    lastTime =  time; \
+    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
+
+  PT_BEGIN(pt);
+
+  if(!digitalRead(DPIN_DRV_MODE)) {
+    set_amount(amount_current/4);
+    digitalWrite(DPIN_DRV_MODE, HIGH);
+  }
+
+  knob = sqrt((float)amount_current/255.0)*255.0;
+
+  do {
+    PT_WAIT_FOR_PERIOD(pt,50);
+    float angle = readAccelAngleXZ();
+    float change = angle - lastKnobAngle;
+    lastKnobAngle = angle;
+
+    // Don't bother updating our brightness reading if our angle isn't good.
+    char acc[3];
+    readAccel(acc);
+    if(acc[0]*acc[0] + acc[2]*acc[2] >= 8*8) {
+      if (change >  PI) change -= 2.0*PI;
+      if (change < -PI) change += 2.0*PI;
+      knob += -change * 40.0;
+      if (knob < 0)   knob = 0;
+      if (knob > 255) knob = 255;
+    }
+
+    // Make apparent brightness changes linear by squaring the
+    // value and dividing back down into range.  This gives us
+    // a gamma correction of 2.0, which is close enough.
+    byte bright = (long)(knob * knob) >> 8;
+
+    // Avoid ever appearing off in this mode!
+    if (bright < 8) bright = 8;
+
+    fade_to_amount(bright,50);
+  } while(amount_current && (button_pressed_duration<10));
+
+  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
 
   PT_END(pt);
 }
@@ -248,10 +303,6 @@ PT_THREAD(light_pt_func(struct pt *pt))
   static byte level = 1;
 
   PT_BEGIN(pt);
-
-#define PT_WAIT_FOR_PERIOD(pt,x) \
-    lastTime =  time; \
-    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
 
   level--;
   button_released_time = time;
@@ -428,7 +479,7 @@ loop(void)
   power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
 
-#define NUMBER_OF_MODES    (3)
+#define NUMBER_OF_MODES    (4)
 
   static byte light_mode;
   static byte last_mode;
@@ -463,6 +514,7 @@ loop(void)
       case 0: thread_status = light_pt_func(&light_pt); break;
       case 1: thread_status = light_momentary_pt_func(&light_momentary_pt); break;
       case 2: thread_status = light_blinky_pt_func(&light_blinky_pt); break;
+      case 3: thread_status = light_knob_pt_func(&light_knob_pt); break;
     }
     if(!PT_SCHEDULE(thread_status)) {
       light_mode = 0;
