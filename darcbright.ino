@@ -65,6 +65,7 @@ struct pt light_pt;
 struct pt fade_control_pt;
 struct pt light_momentary_pt;
 struct pt power_pt;
+struct pt light_blinky_pt;
 
 
 
@@ -214,10 +215,29 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
     amount_off = 1;
 
     PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW));
-  } while(1);
+  } while(amount_current);
 
   PT_END(pt);
 
+}
+
+PT_THREAD(light_blinky_pt_func(struct pt *pt))
+{
+  unsigned long time = millis();
+
+  PT_BEGIN(pt);
+
+  PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 10));
+  button_pressed_duration = 0;
+
+  do {
+    amount_off = !((time&(255))<64);
+    PT_YIELD(pt);
+  } while(amount_current && (button_pressed_duration<10));
+
+  amount_off = 0;
+
+  PT_END(pt);
 }
 
 PT_THREAD(light_pt_func(struct pt *pt))
@@ -242,7 +262,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
     PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 10));
 
     if(!level || (button_released_duration<2*1000)) {
-      Serial.println("Incrementing mode");
+      Serial.println("Incrementing intensity");
       level++;
       level &= 3;
     } else {
@@ -408,18 +428,46 @@ loop(void)
   power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
 
-  static byte light_mode = 0;
-  if((button_pressed_duration > 2*1000) && !light_mode_did_change) {
-    Serial.println("Mode change");
-    light_mode = !light_mode;
-    light_mode_did_change = 1;
-    amount_flash = 1;
-    PT_INIT(&light_pt);
-    PT_INIT(&light_momentary_pt);
-  }
-  switch(light_mode) {
-    case 0: light_pt_func(&light_pt); break;
-    case 1: light_momentary_pt_func(&light_momentary_pt); break;
+#define NUMBER_OF_MODES    (3)
+
+  static byte light_mode;
+  static byte last_mode;
+  if((button_pressed_duration > 2048)) {
+    byte selected_mode = (button_pressed_duration-2048)/512 + 1;
+    if(selected_mode-1>=light_mode) {
+      selected_mode++;
+    }
+    if(selected_mode > NUMBER_OF_MODES)
+      selected_mode = NUMBER_OF_MODES;
+    if(selected_mode-1==light_mode)
+      selected_mode--;
+    if(selected_mode != last_mode) {
+      amount_flash = 1;
+      last_mode = selected_mode;
+      Serial.print("Mode selected: ");
+      Serial.println(selected_mode-1);
+    }
+  } else {
+    char thread_status;
+    if(last_mode) {
+      light_mode = last_mode-1;
+      last_mode = 0;
+      Serial.print("Mode change: ");
+      Serial.println(light_mode);
+      PT_INIT(&light_pt);
+      PT_INIT(&light_momentary_pt);
+      PT_INIT(&light_blinky_pt);
+    }
+    switch(light_mode) {
+      default:
+      case 0: thread_status = light_pt_func(&light_pt); break;
+      case 1: thread_status = light_momentary_pt_func(&light_momentary_pt); break;
+      case 2: thread_status = light_blinky_pt_func(&light_blinky_pt); break;
+    }
+    if(!PT_SCHEDULE(thread_status)) {
+      light_mode = 0;
+      fade_to_amount(0,500);
+    }
   }
 
   return;
