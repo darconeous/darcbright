@@ -60,8 +60,11 @@ unsigned long btnTime = 0;
 boolean btnDown = false;
 
 struct pt light_pt;
-
 struct pt fade_control_pt;
+struct pt light_momentary_pt;
+struct pt power_pt;
+
+
 
 byte amount_current;
 byte amount_begin;
@@ -70,11 +73,18 @@ unsigned short amount_fade_duration;
 unsigned long amount_fade_start;
 byte amount_flash,amount_off;
 
+unsigned long button_pressed_time;
+unsigned long button_released_time;
+unsigned long button_pressed_duration;
+unsigned long button_released_duration;
+
 void set_amount(byte amount) {
   amount_current = amount_begin = amount_end = amount;
   amount_fade_duration = 0;
   amount_off = 0;
   analogWrite(DPIN_DRV_EN,amount_current);
+  pinMode(DPIN_PWR, OUTPUT);
+  digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
 }
 
 void fade_to_amount(byte amount, unsigned short fade_duration) {
@@ -106,9 +116,16 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
     fade_time = millis() - amount_fade_start;
 
     if(fade_time >= amount_fade_duration) {
-      amount_current = amount_end;
+      if(amount_current != amount_end) {
+        amount_current = amount_end;
+
+        pinMode(DPIN_PWR, OUTPUT);
+        digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
+      }
     } else {
       amount_current = (((long)amount_end - (long)amount_begin)*fade_time)/amount_fade_duration + amount_begin;
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
     }
 
     analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
@@ -117,40 +134,99 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
   PT_END(pt);
 }
 
-PT_THREAD(light_pt_func(struct pt *pt))
+PT_THREAD(power_pt_func(struct pt *pt))
 {
-  static unsigned long lastTime;
-  static unsigned long debounceTime;
-  static byte level;
+  const unsigned long time = millis();
+  int chargeState;
+  PT_BEGIN(pt);
+
+  do {
+    // Check the state of the charge controller
+    chargeState = analogRead(APIN_CHARGE);
+
+    if (chargeState < 128) {  // Low - charging
+      // Smoothly pulse the green LED over a two-second interval,
+      // as if it were "breathing". This is the charging indication.
+      byte pulse = ((time>>2)&0xFF);
+      pulse = ((pulse * pulse) >> 8);
+      analogWrite(DPIN_GLED, ((time>>2)&0x0100)?0xFF-pulse:pulse);
+
+    } else if (chargeState > 768) {  // High - fully charged.
+      // Solid green LED.
+      analogWrite(DPIN_GLED, 255);
+      digitalWrite(DPIN_GLED, HIGH);
+
+    } else {  // Hi-Z - Not charging, not pulged in.
+      // Blink the indicator LED now and then.
+      digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
+    }
+    PT_YIELD(pt);
+  } while(1);
+
+  PT_END(pt);
+}
+
+PT_THREAD(light_momentary_pt_func(struct pt *pt))
+{
+  unsigned long time = millis();
+
+  if(button_released_duration > 120*1000) {
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, LOW);
+  }
 
   PT_BEGIN(pt);
 
-#define PT_DEBOUNCED_WAIT_UNTIL(pt,x) \
-  do { \
-    PT_WAIT_UNTIL(pt, (x)); \
-    debounceTime = millis(); \
-    PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10); \
-  } while(!(x));
+  do {
+    pinMode(DPIN_PWR, OUTPUT);
+    digitalWrite(DPIN_PWR, HIGH);
+    amount_off = 0;
+
+    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW));
+
+    amount_off = 1;
+
+    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW));
+  } while(1);
+
+  PT_END(pt);
+
+}
+
+PT_THREAD(light_pt_func(struct pt *pt))
+{
+  unsigned long time = millis();
+  static unsigned long lastTime;
+  static unsigned long debounceTime;
+  static byte level = 1;
+
+  PT_BEGIN(pt);
 
 #define PT_WAIT_FOR_PERIOD(pt,x) \
-    lastTime =  millis(); \
-    PT_WAIT_UNTIL(pt, (millis()-lastTime) > (x));
+    lastTime =  time; \
+    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
 
+  level--;
+  button_released_time = time;
+  button_released_duration = 0;
+
+  Serial.println("Starting light thread.");
   do {
-    lastTime =  millis();
-    PT_WAIT_UNTIL(pt, (digitalRead(DPIN_RLED_SW)));
+    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 10));
 
-    if(millis()-lastTime<5000) {
+    if(!level || (button_released_duration<2*1000)) {
+      Serial.println("Incrementing mode");
       level++;
       level &= 3;
     } else {
+      Serial.println("turning off");
       level = 0;
     }
 
     switch(level) {
     case 0:
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, LOW);
+      //pinMode(DPIN_PWR, OUTPUT);
+      //digitalWrite(DPIN_PWR, LOW);
       //digitalWrite(DPIN_DRV_MODE, LOW);
       //analogWrite(DPIN_DRV_EN, 0);
 
@@ -182,60 +258,10 @@ PT_THREAD(light_pt_func(struct pt *pt))
       break;
     }
 
-    lastTime =  millis();
-    do {
-      PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
-      debounceTime = millis();
-      PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
-    } while(!((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
+    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 10));
 
-    if(!digitalRead(DPIN_RLED_SW)) {
-      if(!level)
-        fade_to_amount(0,500);
-      continue;
-    }
-
-    if(!level) {
-      level = 3;
-    }
-
-    amount_flash = 1;
-
-    while(level) {
-      amount_off = 0;
-      lastTime =  millis();
-
-      do {
-        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
-        debounceTime = millis();
-        PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
-      } while(!((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
-
-      if(digitalRead(DPIN_RLED_SW)) {
-        amount_flash = 1;
-        level--;
-        break;
-      }
-
-      amount_off = 1;
-
-      lastTime =  millis();
-      do {
-        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 120*1000 || digitalRead(DPIN_RLED_SW)));
-        debounceTime = millis();
-        PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
-      } while(!((millis()-lastTime) > 120*1000 || digitalRead(DPIN_RLED_SW)));
-
-      amount_off = 0;
-
-      if(!digitalRead(DPIN_RLED_SW)) {
-        set_amount(0);
-        digitalWrite(DPIN_DRV_MODE, LOW);
-        pinMode(DPIN_PWR, OUTPUT);
-        digitalWrite(DPIN_PWR, LOW);
-        level = 0;
-      }
-    }
+    if(!level)
+      fade_to_amount(0,500);
   } while(1);
 
   PT_END(pt);
@@ -299,6 +325,9 @@ setup(void)
   mode = MODE_OFF;
 
   Serial.println("Powered up!");
+
+  button_released_time = millis();
+  button_pressed_time = millis();
 }
 
 void
@@ -308,26 +337,18 @@ loop(void)
   static float lastKnobAngle, knob;
   static byte blink;
   unsigned long time = millis();
-  
-  // Check the state of the charge controller
-  int chargeState = analogRead(APIN_CHARGE);
+  static byte light_mode_did_change = 0;
 
-  if (chargeState < 128) {  // Low - charging
-    // Smoothly pulse the green LED over a two-second interval,
-    // as if it were "breathing". This is the charging indication.
-    byte pulse = ((time>>2)&0xFF);
-    pulse = ((pulse * pulse) >> 8);
-    analogWrite(DPIN_GLED, ((time>>2)&0x0100)?0xFF-pulse:pulse);
-
-  } else if (chargeState > 768) {  // High - fully charged.
-    // Solid green LED.
-    analogWrite(DPIN_GLED, 255);
-    digitalWrite(DPIN_GLED, HIGH);
-
-  } else {  // Hi-Z - Not charging, not pulged in.
-    // Blink the indicator LED now and then.
-    digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
+  if(digitalRead(DPIN_RLED_SW)) {
+    button_released_time = time;
+    button_pressed_duration = time - button_pressed_time;
+  } else {
+    button_pressed_time = time;
+    button_released_duration = time - button_released_time;
+    button_pressed_duration = 0;
+    light_mode_did_change = 0;
   }
+
 
   // Check the serial port
   if(Serial.available()) {
@@ -360,8 +381,8 @@ loop(void)
   if(time-lastTempTime > 1000) {
     lastTempTime = time;
     int temperature = analogRead(APIN_TEMP);
-    Serial.print("chargeState = ");
-    Serial.print(chargeState);
+//    Serial.print("chargeState = ");
+//    Serial.print(chargeState);
     Serial.print(" Temperature = ");
     Serial.println(temperature);
     if(temperature > OVERTEMP) {
@@ -373,8 +394,22 @@ loop(void)
     }
   }
 
-  light_pt_func(&light_pt);
+  power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
+
+  static byte light_mode = 0;
+  if((button_pressed_duration > 2*1000) && !light_mode_did_change) {
+    Serial.println("Mode change");
+    light_mode = !light_mode;
+    light_mode_did_change = 1;
+    amount_flash = 1;
+    PT_INIT(&light_pt);
+    PT_INIT(&light_momentary_pt);
+  }
+  switch(light_mode) {
+    case 0: light_pt_func(&light_pt); break;
+    case 1: light_momentary_pt_func(&light_momentary_pt); break;
+  }
 
   return;
 
