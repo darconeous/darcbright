@@ -19,7 +19,8 @@
 #include "pt.h"
 
 // Settings
-#define OVERTEMP                330
+#define OVERTEMP_SHUTDOWN       370
+#define OVERTEMP_THROTTLE       315
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -58,6 +59,7 @@
 byte mode = 0;
 unsigned long btnTime = 0;
 boolean btnDown = false;
+boolean overtemp_throttle = false;
 
 struct pt light_pt;
 struct pt fade_control_pt;
@@ -128,6 +130,10 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
       digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
     }
 
+    if(overtemp_throttle && (amount_current>64)) {
+      amount_current = 64;
+    }
+
     analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
   } while(1);
 
@@ -137,6 +143,7 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
 PT_THREAD(power_pt_func(struct pt *pt))
 {
   const unsigned long time = millis();
+  static unsigned long lastTempTime;
   int chargeState;
   PT_BEGIN(pt);
 
@@ -160,6 +167,26 @@ PT_THREAD(power_pt_func(struct pt *pt))
       // Blink the indicator LED now and then.
       digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
     }
+
+
+    // Check the temperature sensor
+    if(time-lastTempTime > 1000) {
+      lastTempTime = time;
+      int temperature = analogRead(APIN_TEMP);
+      Serial.print(" Temperature = ");
+      Serial.println(temperature);
+
+      if(temperature > OVERTEMP_SHUTDOWN) {
+        Serial.println("Overheat shutdown!");
+        set_amount(0);
+        digitalWrite(DPIN_DRV_MODE, LOW);
+        digitalWrite(DPIN_DRV_EN, LOW);
+        digitalWrite(DPIN_PWR, LOW);
+      }
+
+      overtemp_throttle = temperature > OVERTEMP_THROTTLE;
+    }
+
     PT_YIELD(pt);
   } while(1);
 
@@ -170,7 +197,7 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
 {
   unsigned long time = millis();
 
-  if(button_released_duration > 120*1000) {
+  if(button_released_duration > 120000) {
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, LOW);
   }
@@ -377,22 +404,6 @@ loop(void)
     }
   }
 
-  // Check the temperature sensor
-  if(time-lastTempTime > 1000) {
-    lastTempTime = time;
-    int temperature = analogRead(APIN_TEMP);
-//    Serial.print("chargeState = ");
-//    Serial.print(chargeState);
-    Serial.print(" Temperature = ");
-    Serial.println(temperature);
-    if(temperature > OVERTEMP) {
-      Serial.println("Overheat shutdown!");
-      mode = MODE_OFF;
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      digitalWrite(DPIN_DRV_EN, LOW);
-      digitalWrite(DPIN_PWR, LOW);
-    }
-  }
 
   power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
