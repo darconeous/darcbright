@@ -16,6 +16,7 @@
 
 #include <math.h>
 #include <Wire.h>
+#include "pt.h"
 
 // Settings
 #define OVERTEMP                330
@@ -57,6 +58,181 @@
 byte mode = 0;
 unsigned long btnTime = 0;
 boolean btnDown = false;
+
+struct pt light_pt;
+
+struct pt fade_control_pt;
+
+byte amount_current;
+byte amount_begin;
+byte amount_end;
+unsigned short amount_fade_duration;
+unsigned long amount_fade_start;
+byte amount_flash,amount_off;
+
+void set_amount(byte amount) {
+  amount_current = amount_begin = amount_end = amount;
+  amount_fade_duration = 0;
+  amount_off = 0;
+}
+
+void fade_to_amount(byte amount, unsigned short fade_duration) {
+  amount_begin = amount_current;
+  amount_end = amount;
+  amount_fade_duration = fade_duration;
+  //amount_fade_duration = 1000;//fade_duration;
+  amount_fade_start = millis();
+  amount_off = 0;
+}
+
+PT_THREAD(fade_control_pt_func(struct pt *pt))
+{
+  static long fade_time;
+
+  PT_BEGIN(pt);
+
+  do {
+    PT_YIELD(pt);
+
+    if(amount_flash) {
+      analogWrite(DPIN_DRV_EN, 0);
+      fade_time =  millis();
+      PT_WAIT_UNTIL(pt, (millis()-fade_time) > (100));
+    }
+
+    amount_flash = 0;
+
+    fade_time = millis() - amount_fade_start;
+
+    if(fade_time >= amount_fade_duration) {
+      amount_current = amount_end;
+    } else {
+      amount_current = (((long)amount_end - (long)amount_begin)*fade_time)/amount_fade_duration + amount_begin;
+    }
+
+    analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
+  } while(1);
+
+  PT_END(pt);
+}
+
+PT_THREAD(light_pt_func(struct pt *pt))
+{
+  static unsigned long lastTime;
+  static unsigned long debounceTime;
+  static byte level;
+
+  PT_BEGIN(pt);
+
+#define PT_DEBOUNCED_WAIT_UNTIL(pt,x) \
+  do { \
+    PT_WAIT_UNTIL(pt, (x)); \
+    debounceTime = millis(); \
+    PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10); \
+  } while(!(x));
+
+#define PT_WAIT_FOR_PERIOD(pt,x) \
+    lastTime =  millis(); \
+    PT_WAIT_UNTIL(pt, (millis()-lastTime) > (x));
+
+  do {
+    lastTime =  millis();
+    PT_WAIT_UNTIL(pt, (digitalRead(DPIN_RLED_SW)));
+
+    if(millis()-lastTime<5000) {
+      level++;
+      level &= 3;
+    } else {
+      level = 0;
+    }
+
+    switch(level) {
+    case 0:
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, LOW);
+      //digitalWrite(DPIN_DRV_MODE, LOW);
+      //analogWrite(DPIN_DRV_EN, 0);
+
+      //fade_to_amount(0,500);
+      break;
+    case 1:
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, HIGH);
+
+      digitalWrite(DPIN_DRV_MODE, LOW);
+      fade_to_amount(64,250);
+      break;
+    case 2:
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, HIGH);
+
+      digitalWrite(DPIN_DRV_MODE, LOW);
+      fade_to_amount(255,500);
+      break;
+    case 3:
+      pinMode(DPIN_PWR, OUTPUT);
+      digitalWrite(DPIN_PWR, HIGH);
+
+      if(!digitalRead(DPIN_DRV_MODE)) {
+        digitalWrite(DPIN_DRV_MODE, HIGH);
+        set_amount(amount_current/4);
+      }
+      fade_to_amount(255,500);
+      break;
+    }
+
+    lastTime =  millis();
+    do {
+      PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
+      debounceTime = millis();
+      PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
+    } while(!((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
+
+    if(!level) {
+      fade_to_amount(0,500);
+    }
+
+    if(!digitalRead(DPIN_RLED_SW)) {
+      continue;
+    }
+
+    amount_flash = 1;
+
+    while(level) {
+      amount_off = 0;
+      lastTime =  millis();
+
+      do {
+        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
+        debounceTime = millis();
+        PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
+      } while(!((millis()-lastTime) > 2000 || !digitalRead(DPIN_RLED_SW)));
+
+      if(digitalRead(DPIN_RLED_SW)) {
+        amount_flash = 1;
+        level--;
+        break;
+      }
+
+      amount_off = 1;
+
+      lastTime =  millis();
+      do {
+        PT_WAIT_UNTIL(pt, ((millis()-lastTime) > 60000 || digitalRead(DPIN_RLED_SW)));
+        debounceTime = millis();
+        PT_WAIT_UNTIL(pt, (millis()-debounceTime)>10);
+      } while(!((millis()-lastTime) > 60000 || digitalRead(DPIN_RLED_SW)));
+
+      amount_off = 0;
+
+      if(!digitalRead(DPIN_RLED_SW)) {
+        level = 0;
+      }
+    }
+  } while(1);
+
+  PT_END(pt);
+}
 
 void
 setup(void)
@@ -189,6 +365,11 @@ loop(void)
       digitalWrite(DPIN_PWR, LOW);
     }
   }
+
+  light_pt_func(&light_pt);
+  fade_control_pt_func(&fade_control_pt);
+
+  return;
 
   // Check if the accelerometer wants to interrupt
   byte tapped = 0, shaked = 0;
