@@ -3,15 +3,15 @@
 ** Modifications authored by Robert Quattlebaum <darco@deepdarc.com>
 **
 ** Added Features:
-**  * Debounce power-on button press.
+**  * Smooth brightness transitions.
+**  * Increases in brightness happen on the button press, decreases on button release.
 **  * Smooth pulsing charging indicator.
 **  * Accelerometer filtering.
+**  * Mode changing by holding down button. (4 "modes": constant, momentary, blinky, knob)
+**  * Overtemp condition now attempts to throttle back brightness instead of just turning off.
 **
 ** TODO:
-**  * Make mode transitions happen immediately on button press
-**    instead of button release.
-**  * Figure out how to add a momentary operation mode.
-**  * Add Smooth transitions between brightness levels.
+**  * Debounce power-on button press.
 */
 
 #include <math.h>
@@ -487,6 +487,25 @@ loop(void)
     }
   }
 
+  // Check if the accelerometer wants to interrupt
+//  byte tapped = 0, shaked = 0;
+//  if (!digitalRead(DPIN_ACC_INT)) {
+//    Wire.beginTransmission(ACC_ADDRESS);
+//    Wire.write(ACC_REG_TILT);
+//    Wire.endTransmission(false);       // End, but do not stop!
+//    Wire.requestFrom(ACC_ADDRESS, 1);  // This one stops.
+//    byte tilt = Wire.read();
+//
+//    if (time-lastAccTime > 500) {
+//      lastAccTime = time;
+//
+//      tapped = !!(tilt & 0x20);
+//      shaked = !!(tilt & 0x80);
+//
+//      if (tapped) Serial.println("Tap!");
+//      if (shaked) Serial.println("Shake!");
+//    }
+//  }
 
   power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
@@ -536,228 +555,6 @@ loop(void)
   }
 
   return;
-
-  // Check if the accelerometer wants to interrupt
-  byte tapped = 0, shaked = 0;
-  if (!digitalRead(DPIN_ACC_INT)) {
-    Wire.beginTransmission(ACC_ADDRESS);
-    Wire.write(ACC_REG_TILT);
-    Wire.endTransmission(false);       // End, but do not stop!
-    Wire.requestFrom(ACC_ADDRESS, 1);  // This one stops.
-    byte tilt = Wire.read();
-    
-    if (time-lastAccTime > 500) {
-      lastAccTime = time;
-  
-      tapped = !!(tilt & 0x20);
-      shaked = !!(tilt & 0x80);
-  
-      if (tapped) Serial.println("Tap!");
-      if (shaked) Serial.println("Shake!");
-    }
-  }
-
-  // Do whatever this mode does
-  switch (mode) {
-  case MODE_KNOBBED:
-  case MODE_KNOBBING:
-    {
-      if (time-lastTime > 100 && !tapped) {
-        lastTime = time;
-  
-        float angle = readAccelAngleXZ();
-        float change = angle - lastKnobAngle;
-        lastKnobAngle = angle;
-
-        // Don't bother updating our brightness reading if our angle isn't good.
-        char acc[3];
-        readAccel(acc);
-        if(acc[0]*acc[0] + acc[2]*acc[2] >= 8*8) {
-          if (change >  PI) change -= 2.0*PI;
-          if (change < -PI) change += 2.0*PI;
-          knob += -change * 40.0;
-          if (knob < 0)   knob = 0;
-          if (knob > 255) knob = 255;
-        }
-      }
-
-      // Make apparent brightness changes linear by squaring the
-      // value and dividing back down into range.  This gives us
-      // a gamma correction of 2.0, which is close enough.
-      byte bright = (long)(knob * knob) >> 8;
-
-      // Avoid ever appearing off in this mode!
-      if (bright < 8) bright = 8;
-
-      static byte actual_bright = 8;
-
-      if(bright>actual_bright)
-        actual_bright++;
-
-      if(bright<actual_bright)
-        actual_bright--;
-
-      analogWrite(DPIN_DRV_EN, actual_bright);
-  
-//      Serial.print("Ang = ");
-//      Serial.print(angle);
-//      Serial.print("\tChange = ");
-//      Serial.print(change);
-//      Serial.print("\tKnob = ");
-//      Serial.print(knob);
-//      Serial.print("\tBright = ");
-//      Serial.println(bright);
-    }
-    break;
-  case MODE_BLINKING:
-  case MODE_BLINKING_PREVIEW:
-    blink = ((time&(255))<64);
-    digitalWrite(DPIN_DRV_EN, blink);
-    break;
-  case MODE_DAZZLING:
-  case MODE_DAZZLING_PREVIEW:
-    if (time-lastTime < 10) break;
-    lastTime = time;
-    
-    digitalWrite(DPIN_DRV_EN, random(4)<1);
-    break;
-  }
-  
-  // Check for mode changes
-  byte newMode = mode;
-  byte newBtnDown = digitalRead(DPIN_RLED_SW);
-  switch(mode) {
-  case MODE_OFF:
-    if (btnDown && !newBtnDown && (time-btnTime)>50)  // Button released
-      newMode = MODE_LOW;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_KNOBBING;
-    break;
-  case MODE_LOW:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_MED;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_KNOBBING;
-    break;
-  case MODE_MED:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_HIGH;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_KNOBBING;
-    break;
-  case MODE_HIGH:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_OFF;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_KNOBBING;
-    break;
-  case MODE_KNOBBING:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_KNOBBED;
-    if (btnDown && newBtnDown && tapped)
-      newMode = MODE_BLINKING_PREVIEW;
-    break;
-  case MODE_KNOBBED:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_OFF;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_KNOBBING;
-    break;
-  case MODE_BLINKING:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_OFF;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_BLINKING_PREVIEW;
-    break;
-  case MODE_BLINKING_PREVIEW:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_BLINKING;
-    if (btnDown && newBtnDown && tapped)
-      newMode = MODE_DAZZLING_PREVIEW;
-    break;
-  case MODE_DAZZLING:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_OFF;
-    if (btnDown && newBtnDown && (time-btnTime)>500)  // Held
-      newMode = MODE_DAZZLING_PREVIEW;
-    break;
-  case MODE_DAZZLING_PREVIEW:
-    if (btnDown && !newBtnDown)  // Button released
-      newMode = MODE_DAZZLING;
-    if (btnDown && newBtnDown && tapped)
-      newMode = MODE_BLINKING_PREVIEW;
-    break;
-  }
-
-  // Do the mode transitions
-  if (newMode != mode)
-  {
-    switch (newMode)
-    {
-    case MODE_OFF:
-      Serial.println("Mode = off");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, LOW);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      digitalWrite(DPIN_DRV_EN, LOW);
-      break;
-    case MODE_LOW:
-      Serial.println("Mode = low");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      analogWrite(DPIN_DRV_EN, 64);
-      break;
-    case MODE_MED:
-      Serial.println("Mode = medium");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      analogWrite(DPIN_DRV_EN, 255);
-      break;
-    case MODE_HIGH:
-      Serial.println("Mode = high");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, HIGH);
-      analogWrite(DPIN_DRV_EN, 255);
-      break;
-    case MODE_KNOBBING:
-      Serial.println("Mode = knobbing");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      lastKnobAngle = readAccelAngleXZ();
-      //knob = (mode==MODE_OFF) ? 0 : 255;
-      break;
-    case MODE_KNOBBED:
-      Serial.println("Mode = knobbed");
-      break;
-    case MODE_BLINKING:
-    case MODE_BLINKING_PREVIEW:
-      Serial.println("Mode = blinking");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      break;
-    case MODE_DAZZLING:
-    case MODE_DAZZLING_PREVIEW:
-      Serial.println("Mode = dazzling");
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, HIGH);
-      break;
-    }
-
-    mode = newMode;
-  }
-
-  // Remember button state so we can detect transitions
-  if (newBtnDown != btnDown)
-  {
-    btnTime = time;
-    btnDown = newBtnDown;
-    delay(50);
-  }
 }
 
 void readAccel(char *acc)
