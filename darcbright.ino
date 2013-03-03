@@ -17,6 +17,7 @@
 #include <math.h>
 #include <Wire.h>
 #include "pt.h"
+#include <EEPROM.h>
 
 // Settings
 #define OVERTEMP_SHUTDOWN       370
@@ -56,10 +57,11 @@
 #define MODE_DAZZLING_PREVIEW   10
 
 // State
-byte mode = 0;
-unsigned long btnTime = 0;
-boolean btnDown = false;
-boolean overtemp_throttle = false;
+//byte mode = 0;
+//unsigned long btnTime = 0;
+//boolean btnDown = false;
+boolean overtemp_throttle;
+byte light_mode;
 
 struct pt fade_control_pt;
 struct pt power_pt;
@@ -83,7 +85,47 @@ unsigned long button_released_time;
 unsigned long button_pressed_duration;
 unsigned long button_released_duration;
 
-void set_amount(byte amount) {
+void
+retrieve_settings(void) {
+  byte data[4];
+  data[0] = EEPROM.read(0);
+  data[1] = EEPROM.read(1);
+  data[2] = EEPROM.read(2);
+  data[3] = EEPROM.read(3);
+  if(data[0] == (byte)~(data[1]^data[2]^data[3] + sizeof(data))) {
+    light_mode = data[2];
+    if(light_mode) {
+      set_amount(data[1]);
+      digitalWrite(DPIN_DRV_MODE,data[3]);
+    }
+    Serial.println("Settings retrieved");
+  }
+}
+
+void
+save_settings(void) {
+  byte data[4];
+  data[1] = amount_current;
+  data[2] = light_mode;
+  data[3] = digitalRead(DPIN_DRV_MODE);
+  data[0] = ~(data[1]^data[2]^data[3] + sizeof(data));
+  EEPROM.write(0,data[0]);
+  EEPROM.write(1,data[1]);
+  EEPROM.write(2,data[2]);
+  EEPROM.write(3,data[3]);
+//  Serial.println("Settings saved");
+//
+//  data[0] = EEPROM.read(0);
+//  data[1] = EEPROM.read(1);
+//  data[2] = EEPROM.read(2);
+//  data[3] = EEPROM.read(3);
+//  if(data[0] == (byte)~(data[1]^data[2]^data[3] + sizeof(data))) {
+//    Serial.println("Settings verified");
+//  }
+}
+
+void
+set_amount(byte amount) {
   amount_current = amount_begin = amount_end = amount;
   amount_fade_duration = 0;
   amount_off = 0;
@@ -92,11 +134,19 @@ void set_amount(byte amount) {
   digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
 }
 
-void fade_to_amount(byte amount, unsigned short fade_duration) {
+void
+fade_to_amount(byte amount, unsigned short fade_duration) {
+  if((amount == 0) && (amount_current < 64) && digitalRead(DPIN_DRV_MODE)) {
+    // Automatically fall back to "low" mode on the driver when
+    // we are already dim and fading to black. This helps make the transition
+    // appear more smooth.
+    amount_current *= 4;
+    digitalWrite(DPIN_DRV_MODE,LOW);
+    analogWrite(DPIN_DRV_EN,amount_current);
+  }
   amount_begin = amount_current;
   amount_end = amount;
   amount_fade_duration = fade_duration;
-  //amount_fade_duration = 1000;//fade_duration;
   amount_fade_start = millis();
   amount_off = 0;
 }
@@ -200,9 +250,11 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
 {
   unsigned long time = millis();
 
+  // If more than two minutes go by without the user
+  // pressing a button, then go ahead and shut down.
   if(button_released_duration > 120000) {
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, LOW);
+    pinMode(DPIN_PWR, OUTPUT);
+    digitalWrite(DPIN_PWR, LOW);
   }
 
   PT_BEGIN(pt);
@@ -312,19 +364,39 @@ PT_THREAD(light_pt_func(struct pt *pt))
   unsigned long time = millis();
   static unsigned long lastTime;
   static unsigned long debounceTime;
-  static byte level = 1;
+  static byte level;
 
   PT_BEGIN(pt);
 
-  level--;
+  // Estimate what the current brighness level is closest to.
+  if(digitalRead(DPIN_DRV_MODE)) {
+    if(amount_current <= 8) {
+      level = 0;
+    } else if(amount_current <= 32) {
+      level = 1;
+    } else if(amount_current <= 128) {
+      level = 2;
+    } else {
+      level = 3;
+    }
+  } else {
+    if(amount_current <= 32) {
+      level = 0;
+    } else if(amount_current <= 128) {
+      level = 1;
+    } else {
+      level = 2;
+    }
+  }
+
   button_released_time = time;
   button_released_duration = 0;
 
   Serial.println("Starting light thread.");
   do {
-    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 10));
+    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 20));
 
-    if(!level || (button_released_duration<2*1000)) {
+    if(!amount_current || (button_released_duration<600)) {
       Serial.println("Incrementing intensity");
       level++;
       level &= 3;
@@ -368,7 +440,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
       break;
     }
 
-    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 10));
+    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 20));
 
     if(!level)
       fade_to_amount(0,500);
@@ -427,17 +499,23 @@ setup(void)
   Wire.write(enable, sizeof(enable));
   Wire.endTransmission();
   
-  btnTime = millis();
-  btnDown = digitalRead(DPIN_RLED_SW);
+//  btnTime = millis();
+//  btnDown = digitalRead(DPIN_RLED_SW);
 
   // We are initially in the "off" state. We will transition
   // to something else in the main loop.
-  mode = MODE_OFF;
+  //mode = MODE_OFF;
 
   Serial.println("Powered up!");
 
   button_released_time = millis();
   button_pressed_time = millis();
+
+  int chargeState = analogRead(APIN_CHARGE);
+
+  if ((chargeState >= 128) && (chargeState <= 768)) {  // Low - charging
+    retrieve_settings();
+  }
 }
 
 void
@@ -447,7 +525,6 @@ loop(void)
   static float lastKnobAngle, knob;
   static byte blink;
   unsigned long time = millis();
-  static byte light_mode_did_change = 0;
 
   if(digitalRead(DPIN_RLED_SW)) {
     button_released_time = time;
@@ -456,7 +533,6 @@ loop(void)
     button_pressed_time = time;
     button_released_duration = time - button_released_time;
     button_pressed_duration = 0;
-    light_mode_did_change = 0;
   }
 
 
@@ -512,10 +588,25 @@ loop(void)
 
 #define NUMBER_OF_MODES    (4)
 
-  static byte light_mode;
   static byte last_mode;
-  if((button_pressed_duration > 2048)) {
+  static byte save_mode;
+  if((button_pressed_duration > 2048+1024+512*NUMBER_OF_MODES+1024)) {
+    if(save_mode == 1) {
+      amount_off = 1;
+      save_settings();
+      amount_off = 0;
+      save_mode = 2;
+      //fade_to_amount(0,500);
+    }
+  } else if((button_pressed_duration > 2048+1024+512*NUMBER_OF_MODES)) {
+    amount_off = ((button_pressed_duration/64) & 1);
+    if(save_mode == 0) {
+      save_mode = 1;
+      last_mode = 0;
+    }
+  } else if((button_pressed_duration > 2048)) {
     byte selected_mode = (button_pressed_duration-2048)/512 + 1;
+    amount_off = 0;
     if(selected_mode-1>=light_mode) {
       selected_mode++;
     }
@@ -531,6 +622,12 @@ loop(void)
     }
   } else {
     char thread_status;
+    if(save_mode) {
+      save_mode = 0;
+      amount_off = 0;
+      button_pressed_duration = 0;
+      button_released_duration = 0;
+    }
     if(last_mode) {
       light_mode = last_mode-1;
       last_mode = 0;
