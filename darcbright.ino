@@ -255,12 +255,24 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
 
   PT_BEGIN(pt);
 
+  // If we aren't running the driver in 'high' mode,
+  // then go ahead and set it to high mode. Also adjust
+  // the amount so that it is as close as possible in brightness.
   if(!digitalRead(DPIN_DRV_MODE)) {
     set_amount(amount_current/4);
     digitalWrite(DPIN_DRV_MODE, HIGH);
   }
 
+  // Set the initial knob value based on our current light bightness level.
   knob = sqrt((float)amount_current/255.0)*255.0;
+
+  // Wait for a brief moment for any vibrations to stabalize.
+  PT_WAIT_FOR_PERIOD(pt,50);
+
+  // We read this three times to make sure our filtering has stabalized.
+  lastKnobAngle = readAccelAngleXZ();
+  lastKnobAngle = readAccelAngleXZ();
+  lastKnobAngle = readAccelAngleXZ();
 
   do {
     PT_WAIT_FOR_PERIOD(pt,50);
@@ -285,7 +297,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     byte bright = (long)(knob * knob) >> 8;
 
     // Avoid ever appearing off in this mode!
-    if (bright < 8) bright = 8;
+    if (bright < 4) bright = 4;
 
     fade_to_amount(bright,50);
   } while(amount_current && (button_pressed_duration<10));
@@ -508,6 +520,7 @@ loop(void)
       PT_INIT(&light_pt);
       PT_INIT(&light_momentary_pt);
       PT_INIT(&light_blinky_pt);
+      PT_INIT(&light_knob_pt);
     }
     switch(light_mode) {
       default:
