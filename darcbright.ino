@@ -318,6 +318,9 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   // Set the initial knob value based on our current light bightness level.
   knob = sqrt((float)amount_current/255.0)*255.0;
 
+  // Wait for the user to let go of the button.
+  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
+
   // Wait for a brief moment for any vibrations to stabalize.
   PT_WAIT_FOR_PERIOD(pt,50);
 
