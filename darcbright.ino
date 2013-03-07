@@ -20,8 +20,6 @@
 #include <EEPROM.h>
 
 // Settings
-#define OVERTEMP_SHUTDOWN       370
-#define OVERTEMP_THROTTLE       315
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -86,8 +84,8 @@ unsigned long button_released_time;
 unsigned long button_pressed_duration;
 unsigned long button_released_duration;
 
-long readVcc() {
-  long result;
+short readVcc() {
+  short result;
   // Read 1.1V reference against AVcc
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
   delay(2); // Wait for Vref to settle
@@ -127,15 +125,6 @@ save_settings(void) {
   EEPROM.write(1,data[1]);
   EEPROM.write(2,data[2]);
   EEPROM.write(3,data[3]);
-//  Serial.println("Settings saved");
-//
-//  data[0] = EEPROM.read(0);
-//  data[1] = EEPROM.read(1);
-//  data[2] = EEPROM.read(2);
-//  data[3] = EEPROM.read(3);
-//  if(data[0] == (byte)~(data[1]^data[2]^data[3] + sizeof(data))) {
-//    Serial.println("Settings verified");
-//  }
 }
 
 void
@@ -202,6 +191,9 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
     }
 
     analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
+
+    if(!amount_current)
+      digitalWrite(DPIN_DRV_MODE, LOW);
   } while(1);
 
   PT_END(pt);
@@ -210,7 +202,6 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
 PT_THREAD(power_pt_func(struct pt *pt))
 {
   const unsigned long time = millis();
-  static unsigned long lastTempTime;
   int chargeState;
   PT_BEGIN(pt);
 
@@ -235,40 +226,68 @@ PT_THREAD(power_pt_func(struct pt *pt))
       digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
     }
 
+#define VOLTAGE_NOMINAL        3400
+#define VOLTAGE_LOW            3100
+
+#define OVERTEMP_SHUTDOWN       (long)((long)370*VOLTAGE_NOMINAL/(long)1024)
+#define OVERTEMP_THROTTLE       (long)(OVERTEMP_SHUTDOWN-200)
 
     // Check the temperature sensor
     {
-      int temperature = analogRead(APIN_TEMP);
-      long voltage = readVcc();
+      short voltage = readVcc();
+      short temperature = analogRead(APIN_TEMP)*(long)voltage/1024;
       byte pgood = digitalRead(DPIN_PGOOD);
-
-      if(time-lastTempTime > 250) {
-        lastTempTime = time;
-        Serial.print("LEDdriver=");
-        Serial.print(pgood?"Yes ":"No ");
-        Serial.print("Vcc=");
-        Serial.print(voltage);
-        Serial.print("mv Temperature=");
-        Serial.println(temperature);
-      }
+      static bool low_power_condition = false;
 
       if(temperature > OVERTEMP_SHUTDOWN) {
-        Serial.println("Overheat shutdown!");
+        if(amount_current)
+          Serial.println("Overheat shutdown!");
         set_amount(0);
         digitalWrite(DPIN_DRV_MODE, LOW);
         digitalWrite(DPIN_DRV_EN, LOW);
         digitalWrite(DPIN_PWR, LOW);
       }
 
-      static bool low_power_condition = false;
-      if(low_power_condition || (voltage<3200)) {
+      if(low_power_condition || (voltage<VOLTAGE_LOW)) {
         low_power_condition = true;
-        overtemp_throttle = 64;
+        if((voltage < VOLTAGE_LOW) && (overtemp_max > 4))
+          overtemp_max--;
+        if((voltage > VOLTAGE_NOMINAL+50) && (overtemp_max != 255))
+          overtemp_max++;
         digitalWrite(DPIN_DRV_MODE,LOW);
-      } else if(temperature > OVERTEMP_THROTTLE) {
-        overtemp_throttle = (OVERTEMP_SHUTDOWN - temperature)*4;
       } else {
-        overtemp_throttle = 255;
+        overtemp_max = 255;
+      }
+
+      if(temperature > OVERTEMP_THROTTLE) {
+        overtemp_max = min(overtemp_max,(OVERTEMP_SHUTDOWN - temperature));
+      }
+
+      static unsigned long lastStatTime;
+      if(time-lastStatTime > 1000) {
+        lastStatTime = time;
+        Serial.print("stat:");
+
+        if (chargeState < 128) {  // Low - charging
+          Serial.print(" Charging");
+        } else if (chargeState > 768) {  // High - fully charged.
+          Serial.print(" Fully-charged");
+        } else {  // Hi-Z - Not charging, not pulged in.
+          Serial.print(" Battery");
+        }
+
+        Serial.print(" drv-good=");
+        Serial.print(pgood?"yes":"no");
+        Serial.print(" drv-mode=");
+        Serial.print(digitalRead(DPIN_DRV_MODE)?"hi":"low");
+        Serial.print(" brght=");
+        Serial.print(amount_current);
+        Serial.print(" thrt=");
+        Serial.print(overtemp_max);
+        Serial.print(" Vcc=");
+        Serial.print(voltage);
+        Serial.print("mv Temp=");
+        Serial.println(temperature);
       }
     }
 
@@ -432,9 +451,10 @@ PT_THREAD(light_pt_func(struct pt *pt))
     PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 20));
 
     if(!amount_current || (button_released_duration<600)) {
-      Serial.println("Incrementing intensity");
       level++;
       level &= 3;
+      Serial.print("intensity=");
+      Serial.println(level);
     } else {
       Serial.println("turning off");
       level = 0;
@@ -548,7 +568,9 @@ setup(void)
 
   int chargeState = analogRead(APIN_CHARGE);
 
-  if ((chargeState >= 128) && (chargeState <= 768)) {  // Low - charging
+  // Don't bother loading the settings if we are connected to USB.
+  // Only load the settings when we are running from the battery.
+  if ((chargeState >= 128) && (chargeState <= 768)) {
     retrieve_settings();
   }
 }
