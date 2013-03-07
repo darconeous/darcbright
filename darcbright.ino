@@ -61,6 +61,7 @@
 //unsigned long btnTime = 0;
 //boolean btnDown = false;
 boolean overtemp_throttle;
+byte overtemp_max = 255;
 byte light_mode;
 
 struct pt fade_control_pt;
@@ -84,6 +85,19 @@ unsigned long button_pressed_time;
 unsigned long button_released_time;
 unsigned long button_pressed_duration;
 unsigned long button_released_duration;
+
+long readVcc() {
+  long result;
+  // Read 1.1V reference against AVcc
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Convert
+  while (bit_is_set(ADCSRA,ADSC));
+  result = ADCL;
+  result |= ADCH<<8;
+  result = 1126400L / result; // Back-calculate AVcc in mV
+  return result;
+}
 
 void
 retrieve_settings(void) {
@@ -183,8 +197,8 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
       digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
     }
 
-    if(overtemp_throttle && (amount_current>64)) {
-      amount_current = 64;
+    if(amount_current>overtemp_max) {
+      amount_current = overtemp_max;
     }
 
     analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
@@ -223,21 +237,37 @@ PT_THREAD(power_pt_func(struct pt *pt))
 
 
     // Check the temperature sensor
-    if(time-lastTempTime > 1000) {
+    int temperature = analogRead(APIN_TEMP);
+    long voltage = readVcc();
+    byte pgood = digitalRead(DPIN_PGOOD);
+
+    if(time-lastTempTime > 250) {
       lastTempTime = time;
-      int temperature = analogRead(APIN_TEMP);
-      Serial.print(" Temperature = ");
+      Serial.print("LEDdriver=");
+      Serial.print(pgood?"Yes ":"No ");
+      Serial.print("Vcc=");
+      Serial.print(voltage);
+      Serial.print("mv Temperature=");
       Serial.println(temperature);
+    }
 
-      if(temperature > OVERTEMP_SHUTDOWN) {
-        Serial.println("Overheat shutdown!");
-        set_amount(0);
-        digitalWrite(DPIN_DRV_MODE, LOW);
-        digitalWrite(DPIN_DRV_EN, LOW);
-        digitalWrite(DPIN_PWR, LOW);
-      }
+    if(temperature > OVERTEMP_SHUTDOWN) {
+      Serial.println("Overheat shutdown!");
+      set_amount(0);
+      digitalWrite(DPIN_DRV_MODE, LOW);
+      digitalWrite(DPIN_DRV_EN, LOW);
+      digitalWrite(DPIN_PWR, LOW);
+    }
 
-      overtemp_throttle = temperature > OVERTEMP_THROTTLE;
+    static bool low_power_condition = false;
+    if(low_power_condition || (voltage<3200)) {
+      low_power_condition = true;
+      overtemp_throttle = 64;
+      digitalWrite(DPIN_DRV_MODE,LOW);
+    } else if(temperature > OVERTEMP_THROTTLE) {
+      overtemp_throttle = (OVERTEMP_SHUTDOWN - temperature)*4;
+    } else {
+      overtemp_throttle = 255;
     }
 
     PT_YIELD(pt);
@@ -338,7 +368,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     // Don't bother updating our brightness reading if our angle isn't good.
     char acc[3];
     readAccel(acc);
-    if(acc[0]*acc[0] + acc[2]*acc[2] >= 8*8) {
+    if(acc[0]*acc[0] + acc[2]*acc[2] >= 10*10) {
       if (change >  PI) change -= 2.0*PI;
       if (change < -PI) change += 2.0*PI;
       knob += -change * 40.0;
