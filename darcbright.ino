@@ -237,37 +237,39 @@ PT_THREAD(power_pt_func(struct pt *pt))
 
 
     // Check the temperature sensor
-    int temperature = analogRead(APIN_TEMP);
-    long voltage = readVcc();
-    byte pgood = digitalRead(DPIN_PGOOD);
+    {
+      int temperature = analogRead(APIN_TEMP);
+      long voltage = readVcc();
+      byte pgood = digitalRead(DPIN_PGOOD);
 
-    if(time-lastTempTime > 250) {
-      lastTempTime = time;
-      Serial.print("LEDdriver=");
-      Serial.print(pgood?"Yes ":"No ");
-      Serial.print("Vcc=");
-      Serial.print(voltage);
-      Serial.print("mv Temperature=");
-      Serial.println(temperature);
-    }
+      if(time-lastTempTime > 250) {
+        lastTempTime = time;
+        Serial.print("LEDdriver=");
+        Serial.print(pgood?"Yes ":"No ");
+        Serial.print("Vcc=");
+        Serial.print(voltage);
+        Serial.print("mv Temperature=");
+        Serial.println(temperature);
+      }
 
-    if(temperature > OVERTEMP_SHUTDOWN) {
-      Serial.println("Overheat shutdown!");
-      set_amount(0);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      digitalWrite(DPIN_DRV_EN, LOW);
-      digitalWrite(DPIN_PWR, LOW);
-    }
+      if(temperature > OVERTEMP_SHUTDOWN) {
+        Serial.println("Overheat shutdown!");
+        set_amount(0);
+        digitalWrite(DPIN_DRV_MODE, LOW);
+        digitalWrite(DPIN_DRV_EN, LOW);
+        digitalWrite(DPIN_PWR, LOW);
+      }
 
-    static bool low_power_condition = false;
-    if(low_power_condition || (voltage<3200)) {
-      low_power_condition = true;
-      overtemp_throttle = 64;
-      digitalWrite(DPIN_DRV_MODE,LOW);
-    } else if(temperature > OVERTEMP_THROTTLE) {
-      overtemp_throttle = (OVERTEMP_SHUTDOWN - temperature)*4;
-    } else {
-      overtemp_throttle = 255;
+      static bool low_power_condition = false;
+      if(low_power_condition || (voltage<3200)) {
+        low_power_condition = true;
+        overtemp_throttle = 64;
+        digitalWrite(DPIN_DRV_MODE,LOW);
+      } else if(temperature > OVERTEMP_THROTTLE) {
+        overtemp_throttle = (OVERTEMP_SHUTDOWN - temperature)*4;
+      } else {
+        overtemp_throttle = 255;
+      }
     }
 
     PT_YIELD(pt);
