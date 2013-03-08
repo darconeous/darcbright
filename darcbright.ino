@@ -16,10 +16,16 @@
 
 #include <math.h>
 #include <Wire.h>
-#include "pt.h"
 #include <EEPROM.h>
+#include "pt.h"
+#include <avr/wdt.h>
 
 // Settings
+#define VOLTAGE_NOMINAL         3400
+#define VOLTAGE_LOW             3100
+#define OVERTEMP_SHUTDOWN_C     70
+#define OVERTEMP_SHUTDOWN       (OVERTEMP_SHUTDOWN_C*10+500)
+#define OVERTEMP_THROTTLE       (long)(OVERTEMP_SHUTDOWN-250)
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -31,7 +37,6 @@
 // Pin assignments
 #define DPIN_RLED_SW            2
 #define DPIN_GLED               5
-#define DPIN_PGOOD              7
 #define DPIN_PWR                8
 #define DPIN_DRV_MODE           9
 #define DPIN_DRV_EN             10
@@ -41,48 +46,31 @@
 // Interrupts
 #define INT_SW                  0
 #define INT_ACC                 1
-// Modes
-#define MODE_POWERUP            0
-#define MODE_OFF                1
-#define MODE_LOW                2
-#define MODE_MED                3
-#define MODE_HIGH               4
-#define MODE_KNOBBING           5
-#define MODE_KNOBBED            6
-#define MODE_BLINKING           7
-#define MODE_BLINKING_PREVIEW   8
-#define MODE_DAZZLING           9
-#define MODE_DAZZLING_PREVIEW   10
 
 // State
-//byte mode = 0;
-//unsigned long btnTime = 0;
-//boolean btnDown = false;
-boolean overtemp_throttle;
 byte overtemp_max = 255;
 byte light_mode;
-
-struct pt fade_control_pt;
-struct pt power_pt;
-
-struct pt light_pt;
-struct pt light_momentary_pt;
-struct pt light_blinky_pt;
-struct pt light_knob_pt;
-
-
-
 byte amount_current;
 byte amount_begin;
 byte amount_end;
 unsigned short amount_fade_duration;
 unsigned long amount_fade_start;
 byte amount_flash,amount_off;
-
 unsigned long button_pressed_time;
 unsigned long button_released_time;
 unsigned long button_pressed_duration;
 unsigned long button_released_duration;
+
+struct pt fade_control_pt;
+struct pt power_pt;
+struct pt light_pt;
+struct pt light_momentary_pt;
+struct pt light_blinky_pt;
+struct pt light_knob_pt;
+
+#define PT_WAIT_FOR_PERIOD(pt,x) \
+    lastTime =  time; \
+    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
 
 short readVcc() {
   short result;
@@ -220,23 +208,15 @@ PT_THREAD(power_pt_func(struct pt *pt))
       // Solid green LED.
       analogWrite(DPIN_GLED, 255);
       digitalWrite(DPIN_GLED, HIGH);
-
     } else {  // Hi-Z - Not charging, not pulged in.
       // Blink the indicator LED now and then.
       digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
     }
 
-#define VOLTAGE_NOMINAL        3400
-#define VOLTAGE_LOW            3100
-
-#define OVERTEMP_SHUTDOWN       (long)((long)370*VOLTAGE_NOMINAL/(long)1024)
-#define OVERTEMP_THROTTLE       (long)(OVERTEMP_SHUTDOWN-200)
-
     // Check the temperature sensor
     {
       short voltage = readVcc();
       short temperature = analogRead(APIN_TEMP)*(long)voltage/1024;
-      byte pgood = digitalRead(DPIN_PGOOD);
       static bool low_power_condition = false;
 
       if(temperature > OVERTEMP_SHUTDOWN) {
@@ -266,29 +246,32 @@ PT_THREAD(power_pt_func(struct pt *pt))
       static unsigned long lastStatTime;
       if(time-lastStatTime > 1000) {
         lastStatTime = time;
-        Serial.print("stat:");
+        Serial.print("stat: ");
+        Serial.print(time);
 
         if (chargeState < 128) {  // Low - charging
-          Serial.print(" Charging");
+          Serial.print(" [CHARGING]");
         } else if (chargeState > 768) {  // High - fully charged.
-          Serial.print(" Fully-charged");
+          Serial.print(" [CHARGED]");
         } else {  // Hi-Z - Not charging, not pulged in.
-          Serial.print(" Battery");
+          Serial.print(" [BATTERY]");
         }
 
-        Serial.print(" drv-good=");
-        Serial.print(pgood?"yes":"no");
-        Serial.print(" drv-mode=");
-        Serial.print(digitalRead(DPIN_DRV_MODE)?"hi":"low");
-        Serial.print(" brght=");
+        Serial.print(" Duty=");
         Serial.print(amount_current);
-        Serial.print(" thrt=");
-        Serial.print(overtemp_max);
+        Serial.print("-");
+        Serial.print(digitalRead(DPIN_DRV_MODE)?"hi":"low");
         Serial.print(" Vcc=");
         Serial.print(voltage);
         Serial.print("mv Temp=");
-        Serial.println(temperature);
-      }
+        Serial.print((temperature-500)/10);
+        Serial.print("C");
+        if(overtemp_max!=255) {
+          Serial.print(" THRTTL=");
+          Serial.print(overtemp_max);
+        }
+        Serial.println("");
+        }
     }
 
     PT_YIELD(pt);
@@ -323,7 +306,6 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
   } while(amount_current);
 
   PT_END(pt);
-
 }
 
 PT_THREAD(light_blinky_pt_func(struct pt *pt))
@@ -351,10 +333,6 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   unsigned long time = millis();
   static unsigned long lastTime;
   static float lastKnobAngle, knob;
-
-#define PT_WAIT_FOR_PERIOD(pt,x) \
-    lastTime =  time; \
-    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
 
   PT_BEGIN(pt);
 
@@ -507,6 +485,10 @@ PT_THREAD(light_pt_func(struct pt *pt))
 void
 setup(void)
 {
+  // Set our watchdog to kill us if we don't
+  // check in every two seconds.
+  wdt_enable(WDTO_2S);
+
   // We just powered on!  That means either we got plugged 
   // into USB, or (more likely) the user is pressing the 
   // power button.  We need to pull up the enable pin of 
@@ -526,7 +508,6 @@ setup(void)
   pinMode(DPIN_DRV_MODE, OUTPUT);
   pinMode(DPIN_DRV_EN,   OUTPUT);
   pinMode(DPIN_ACC_INT,  INPUT);
-  pinMode(DPIN_PGOOD,    INPUT);
   digitalWrite(DPIN_DRV_MODE, LOW);
   digitalWrite(DPIN_DRV_EN,   LOW);
   digitalWrite(DPIN_ACC_INT,  HIGH);
@@ -583,6 +564,9 @@ loop(void)
   static byte blink;
   unsigned long time = millis();
 
+  // Reset the watchdog timer
+  wdt_reset();
+
   if(digitalRead(DPIN_RLED_SW)) {
     button_released_time = time;
     button_pressed_duration = time - button_pressed_time;
@@ -597,6 +581,30 @@ loop(void)
   if(Serial.available()) {
     char c = Serial.read();
     switch(c) {
+    case 'h':
+      digitalWrite(DPIN_DRV_MODE, HIGH);
+      Serial.println("Driver Mode: HIGH");
+      break;
+
+    case 'l':
+      digitalWrite(DPIN_DRV_MODE, LOW);
+      Serial.println("Driver Mode: LOW");
+      break;
+
+    case '+':
+      if(255-amount_current<10)
+        set_amount(255);
+      else
+        set_amount(amount_current+10);
+      break;
+
+    case '-':
+      if(amount_current<10)
+        set_amount(0);
+      else
+        set_amount(amount_current-10);
+      break;
+
     case 's':
       {
         int temperature = analogRead(APIN_TEMP);
@@ -611,10 +619,6 @@ loop(void)
         Serial.print(accel[1], DEC);
         Serial.print(", ");
         Serial.println(accel[2], DEC);
-      
-        byte pgood = digitalRead(DPIN_PGOOD);
-        Serial.print("LED driver power good = ");
-        Serial.println(pgood?"Yes":"No");
       }
       break;
     }
