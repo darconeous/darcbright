@@ -26,6 +26,8 @@
 #define OVERTEMP_SHUTDOWN_C     70
 #define OVERTEMP_SHUTDOWN       (OVERTEMP_SHUTDOWN_C*10+500)
 #define OVERTEMP_THROTTLE       (long)(OVERTEMP_SHUTDOWN-250)
+#define BUTTON_BRIGHTNESS_THRESHOLD         1000
+
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -34,6 +36,7 @@
 #define ACC_REG_TILT            3
 #define ACC_REG_INTS            6
 #define ACC_REG_MODE            7
+
 // Pin assignments
 #define DPIN_RLED_SW            2
 #define DPIN_GLED               5
@@ -43,6 +46,7 @@
 #define DPIN_ACC_INT            3
 #define APIN_TEMP               0
 #define APIN_CHARGE             3
+
 // Interrupts
 #define INT_SW                  0
 #define INT_ACC                 1
@@ -56,11 +60,8 @@ byte amount_end;
 unsigned short amount_fade_duration;
 unsigned long amount_fade_start;
 byte amount_flash,amount_off;
-unsigned long button_pressed_time;
-unsigned long button_released_time;
-unsigned long button_pressed_duration;
-unsigned long button_released_duration;
 
+// Protothread States
 struct pt fade_control_pt;
 struct pt power_pt;
 struct pt light_pt;
@@ -68,11 +69,52 @@ struct pt light_momentary_pt;
 struct pt light_blinky_pt;
 struct pt light_knob_pt;
 
-#define PT_WAIT_FOR_PERIOD(pt,x) \
-    lastTime =  time; \
-    PT_WAIT_UNTIL(pt, (time-lastTime) > (x));
+// Variables updated every loop
+unsigned long button_pressed_time;
+unsigned long button_released_time;
+unsigned long button_pressed_duration;
+unsigned long button_released_duration;
+short vcc_current;
+short vcc_filter_table[3];
+short vcc_filtered;
+short temp_filter_table[3];
+short temp_filtered;
+short temp_current;
+unsigned long time_current = millis();
 
-short readVcc() {
+#define PT_WAIT_FOR_PERIOD(pt,x) \
+    lastTime =  time_current; \
+    PT_WAIT_UNTIL(pt, (time_current-lastTime) > (x));
+
+void
+update_loop_variables(void) {
+  static char i;
+
+  vcc_filter_table[i] = vcc_current = readVcc();
+  vcc_filtered = median_short(vcc_filter_table[0],vcc_filter_table[1],vcc_filter_table[2]);
+
+  temp_filter_table[i] = analogRead(APIN_TEMP)*(long)vcc_filtered/1024;
+  temp_filtered = median_short(temp_filter_table[0],temp_filter_table[1],temp_filter_table[2])*(long)vcc_filtered/1024;
+  temp_current = temp_filter_table[i]*(long)vcc_current/1024;
+
+  if(++i==3)
+    i=0;
+
+  time_current = millis();
+
+  if(digitalRead(DPIN_RLED_SW)) {
+    button_released_time = time_current;
+    button_pressed_duration = time_current - button_pressed_time;
+  } else {
+    button_pressed_time = time_current;
+    button_released_duration = time_current - button_released_time;
+    button_pressed_duration = 0;
+  }
+}
+
+
+short
+readVcc(void) {
   short result;
   // Read 1.1V reference against AVcc
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
@@ -84,6 +126,7 @@ short readVcc() {
   result = 1126400L / result; // Back-calculate AVcc in mV
   return result;
 }
+
 
 void
 retrieve_settings(void) {
@@ -153,13 +196,13 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
 
     if(amount_flash) {
       analogWrite(DPIN_DRV_EN, 0);
-      fade_time =  millis();
-      PT_WAIT_UNTIL(pt, (millis()-fade_time) > (100));
+      fade_time =  time_current;
+      PT_WAIT_UNTIL(pt, (time_current-fade_time) > (100));
     }
 
     amount_flash = 0;
 
-    fade_time = millis() - amount_fade_start;
+    fade_time = time_current - amount_fade_start;
 
     if(fade_time >= amount_fade_duration) {
       if(amount_current != amount_end) {
@@ -215,11 +258,9 @@ PT_THREAD(power_pt_func(struct pt *pt))
 
     // Check the temperature sensor
     {
-      short voltage = readVcc();
-      short temperature = analogRead(APIN_TEMP)*(long)voltage/1024;
       static bool low_power_condition = false;
 
-      if(temperature > OVERTEMP_SHUTDOWN) {
+      if(temp_filtered > OVERTEMP_SHUTDOWN) {
         if(amount_current)
           Serial.println("Overheat shutdown!");
         set_amount(0);
@@ -228,24 +269,26 @@ PT_THREAD(power_pt_func(struct pt *pt))
         digitalWrite(DPIN_PWR, LOW);
       }
 
-      if(low_power_condition || (voltage<VOLTAGE_LOW)) {
+      if(low_power_condition || (vcc_current<VOLTAGE_LOW)) {
         low_power_condition = true;
-        if((voltage < VOLTAGE_LOW) && (overtemp_max > 4))
+        if((vcc_filtered < VOLTAGE_LOW) && (overtemp_max > 4))
           overtemp_max--;
-        if((voltage > VOLTAGE_NOMINAL+50) && (overtemp_max != 255))
+        if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != 255))
           overtemp_max++;
         digitalWrite(DPIN_DRV_MODE,LOW);
       } else {
         overtemp_max = 255;
       }
 
-      if(temperature > OVERTEMP_THROTTLE) {
-        overtemp_max = min(overtemp_max,(OVERTEMP_SHUTDOWN - temperature));
+      if(temp_filtered > OVERTEMP_THROTTLE) {
+        overtemp_max = min(overtemp_max,(OVERTEMP_SHUTDOWN - temp_filtered));
       }
 
       static unsigned long lastStatTime;
       if(time-lastStatTime > 1000) {
-        lastStatTime = time;
+        while(time-lastStatTime > 1000)
+          lastStatTime += 1000;
+
         Serial.print("stat: ");
         Serial.print(time);
 
@@ -257,15 +300,20 @@ PT_THREAD(power_pt_func(struct pt *pt))
           Serial.print(" [BATTERY]");
         }
 
-        Serial.print(" Duty=");
+        Serial.print(" duty=");
         Serial.print(amount_current);
-        Serial.print("-");
+
+        Serial.print(" mode=");
         Serial.print(digitalRead(DPIN_DRV_MODE)?"hi":"low");
+
         Serial.print(" Vcc=");
-        Serial.print(voltage);
-        Serial.print("mv Temp=");
-        Serial.print((temperature-500)/10);
+        Serial.print(vcc_filtered);
+        Serial.print("mv");
+
+        Serial.print(" Temp=");
+        Serial.print((temp_filtered-500.0f)/10.0f);
         Serial.print("C");
+
         if(overtemp_max!=255) {
           Serial.print(" THRTTL=");
           Serial.print(overtemp_max);
@@ -345,7 +393,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   }
 
   // Set the initial knob value based on our current light bightness level.
-  knob = sqrt((float)amount_current/255.0)*255.0;
+  knob = sqrt((float)amount_current/255.0f)*255.0f;
 
   // Wait for the user to let go of the button.
   PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
@@ -368,9 +416,9 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     char acc[3];
     readAccel(acc);
     if(acc[0]*acc[0] + acc[2]*acc[2] >= 10*10) {
-      if (change >  PI) change -= 2.0*PI;
-      if (change < -PI) change += 2.0*PI;
-      knob += -change * 40.0;
+      if (change >  PI) change -= 2.0f*PI;
+      if (change < -PI) change += 2.0f*PI;
+      knob += -change * 40.0f;
       if (knob < 0)   knob = 0;
       if (knob > 255) knob = 255;
     }
@@ -428,7 +476,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
   do {
     PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 20));
 
-    if(!amount_current || (button_released_duration<600)) {
+    if(!amount_current || (button_released_duration<BUTTON_BRIGHTNESS_THRESHOLD)) {
       level++;
       level &= 3;
       Serial.print("intensity=");
@@ -535,13 +583,6 @@ setup(void)
   Wire.write(enable, sizeof(enable));
   Wire.endTransmission();
   
-//  btnTime = millis();
-//  btnDown = digitalRead(DPIN_RLED_SW);
-
-  // We are initially in the "off" state. We will transition
-  // to something else in the main loop.
-  //mode = MODE_OFF;
-
   Serial.println("Powered up!");
 
   button_released_time = millis();
@@ -554,6 +595,10 @@ setup(void)
   if ((chargeState >= 128) && (chargeState <= 768)) {
     retrieve_settings();
   }
+
+  update_loop_variables();
+  update_loop_variables();
+  update_loop_variables();
 }
 
 void
@@ -567,14 +612,8 @@ loop(void)
   // Reset the watchdog timer
   wdt_reset();
 
-  if(digitalRead(DPIN_RLED_SW)) {
-    button_released_time = time;
-    button_pressed_duration = time - button_pressed_time;
-  } else {
-    button_pressed_time = time;
-    button_released_duration = time - button_released_time;
-    button_pressed_duration = 0;
-  }
+  update_loop_variables();
+
 
 
   // Check the serial port
@@ -740,6 +779,22 @@ void readAccel(char *acc)
 
 /* Returns the median value of the given three parameters */
 char median_char(char a, char b, char c) {
+    if(a<c) {
+        if(b<a) {
+            return a;
+        } else if(c<b) {
+            return c;
+        }
+    } else {
+        if(a<b) {
+            return a;
+        } else if(b<c) {
+            return c;
+        }
+    }
+    return b;
+}
+short median_short(short a, short b, short c) {
     if(a<c) {
         if(b<a) {
             return a;
