@@ -166,6 +166,81 @@ readVcc(void) {
   return result;
 }
 
+void readAccel(char *acc)
+{
+  while (1)
+  {
+    Wire.beginTransmission(ACC_ADDRESS);
+    Wire.write(ACC_REG_XOUT);
+    Wire.endTransmission(false);       // End, but do not stop!
+    Wire.requestFrom(ACC_ADDRESS, 3);  // This one stops.
+
+    for (int i = 0; i < 3; i++)
+    {
+      if (!Wire.available())
+        continue;
+      acc[i] = Wire.read();
+      if (acc[i] & 0x40)  // Indicates failed read; redo!
+        continue;
+      if (acc[i] & 0x20)  // Sign-extend
+        acc[i] |= 0xC0;
+    }
+    break;
+  }
+}
+
+void readAccelFiltered(char *acc_filtered) {
+  static char acc[3][3];
+  static char i;
+  readAccel(acc[i++]);
+  if(i==3)
+    i=0;
+  acc_filtered[0] = median_char(acc[0][0],acc[1][0],acc[2][0]);
+  acc_filtered[1] = median_char(acc[0][1],acc[1][1],acc[2][1]);
+  acc_filtered[2] = median_char(acc[0][2],acc[1][2],acc[2][2]);
+}
+
+/* Returns the median value of the given three parameters */
+char median_char(char a, char b, char c) {
+    if(a<c) {
+        if(b<a) {
+            return a;
+        } else if(c<b) {
+            return c;
+        }
+    } else {
+        if(a<b) {
+            return a;
+        } else if(b<c) {
+            return c;
+        }
+    }
+    return b;
+}
+short median_short(short a, short b, short c) {
+    if(a<c) {
+        if(b<a) {
+            return a;
+        } else if(c<b) {
+            return c;
+        }
+    } else {
+        if(a<b) {
+            return a;
+        } else if(b<c) {
+            return c;
+        }
+    }
+    return b;
+}
+
+
+float readAccelAngleXZ()
+{
+  char acc[3];
+  readAccelFiltered(acc);
+  return atan2(acc[0],acc[2]);
+}
 
 void
 retrieve_settings(void) {
@@ -484,8 +559,8 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
 
     // Don't bother updating our brightness reading if our angle isn't good.
     char acc[3];
-    readAccel(acc);
-    if(acc[0]*acc[0] + acc[2]*acc[2] >= 10*10) {
+    readAccelFiltered(acc);
+    if(acc[0]*acc[0] + acc[2]*acc[2] > 14*14) {
       if (change >  PI) change -= 2.0f*PI;
       if (change < -PI) change += 2.0f*PI;
       knob += -change * 40.0f;
@@ -781,71 +856,4 @@ loop(void)
   return;
 }
 
-void readAccel(char *acc)
-{
-  while (1)
-  {
-    Wire.beginTransmission(ACC_ADDRESS);
-    Wire.write(ACC_REG_XOUT);
-    Wire.endTransmission(false);       // End, but do not stop!
-    Wire.requestFrom(ACC_ADDRESS, 3);  // This one stops.
-
-    for (int i = 0; i < 3; i++)
-    {
-      if (!Wire.available())
-        continue;
-      acc[i] = Wire.read();
-      if (acc[i] & 0x40)  // Indicates failed read; redo!
-        continue;
-      if (acc[i] & 0x20)  // Sign-extend
-        acc[i] |= 0xC0;
-    }
-    break;
-  }
-}
-
-/* Returns the median value of the given three parameters */
-char median_char(char a, char b, char c) {
-    if(a<c) {
-        if(b<a) {
-            return a;
-        } else if(c<b) {
-            return c;
-        }
-    } else {
-        if(a<b) {
-            return a;
-        } else if(b<c) {
-            return c;
-        }
-    }
-    return b;
-}
-short median_short(short a, short b, short c) {
-    if(a<c) {
-        if(b<a) {
-            return a;
-        } else if(c<b) {
-            return c;
-        }
-    } else {
-        if(a<b) {
-            return a;
-        } else if(b<c) {
-            return c;
-        }
-    }
-    return b;
-}
-
-
-float readAccelAngleXZ()
-{
-  static char acc[3][3];
-  static char i;
-  readAccel(acc[i++]);
-  if(i==3)
-    i=0;
-  return atan2(median_char(acc[0][0],acc[1][0],acc[2][0]),median_char(acc[0][2],acc[1][2],acc[2][2]));
-}
 
