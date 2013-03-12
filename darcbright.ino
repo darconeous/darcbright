@@ -21,12 +21,13 @@
 #include <avr/wdt.h>
 
 // Settings
-#define VOLTAGE_NOMINAL         3400
-#define VOLTAGE_LOW             3100
-#define OVERTEMP_SHUTDOWN_C     70
-#define OVERTEMP_SHUTDOWN       (OVERTEMP_SHUTDOWN_C*10+500)
-#define OVERTEMP_THROTTLE       (long)(OVERTEMP_SHUTDOWN-250)
-#define BUTTON_BRIGHTNESS_THRESHOLD         1000
+#define VOLTAGE_NOMINAL               3400
+#define VOLTAGE_LOW                   3100
+#define OVERTEMP_SHUTDOWN_C           70
+#define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
+#define OVERTEMP_THROTTLE             (long)(OVERTEMP_SHUTDOWN-250)
+#define BUTTON_BRIGHTNESS_THRESHOLD   1000 // time in ms, after which a button press turns off
+#define BUTTON_DEBOUNCE               20
 
 // Constants
 #define ACC_ADDRESS             0x4C
@@ -52,7 +53,7 @@
 #define INT_ACC                 1
 
 // State
-byte overtemp_max = 255;
+byte overtemp_max;
 byte light_mode;
 byte amount_current;
 byte amount_begin;
@@ -64,6 +65,9 @@ byte amount_flash,amount_off;
 // Protothread States
 struct pt fade_control_pt;
 struct pt power_pt;
+struct pt button_led_pt;
+
+// Mode Protothread States
 struct pt light_pt;
 struct pt light_momentary_pt;
 struct pt light_blinky_pt;
@@ -80,7 +84,12 @@ short vcc_filtered;
 short temp_filter_table[3];
 short temp_filtered;
 short temp_current;
-unsigned long time_current = millis();
+enum {
+    BATT_DISCHARGING,
+    BATT_CHARGING,
+    BATT_CHARGED,
+} batt_state;
+unsigned long time_current;
 
 #define PT_WAIT_FOR_PERIOD(pt,x) \
     lastTime =  time_current; \
@@ -93,7 +102,7 @@ update_loop_variables(void) {
   vcc_filter_table[i] = vcc_current = readVcc();
   vcc_filtered = median_short(vcc_filter_table[0],vcc_filter_table[1],vcc_filter_table[2]);
 
-  temp_filter_table[i] = analogRead(APIN_TEMP)*(long)vcc_filtered/1024;
+  temp_filter_table[i] = analogRead(APIN_TEMP);
   temp_filtered = median_short(temp_filter_table[0],temp_filter_table[1],temp_filter_table[2])*(long)vcc_filtered/1024;
   temp_current = temp_filter_table[i]*(long)vcc_current/1024;
 
@@ -110,6 +119,36 @@ update_loop_variables(void) {
     button_released_duration = time_current - button_released_time;
     button_pressed_duration = 0;
   }
+
+  short chargeState = analogRead(APIN_CHARGE);
+
+  if (chargeState < 128) {  // Low - charging
+    batt_state = BATT_CHARGING;
+  } else if (chargeState > 768) {  // High - fully charged.
+    batt_state = BATT_CHARGED;
+  } else {  // Hi-Z - Not charging, not pulged in.
+    batt_state = BATT_DISCHARGING;
+  }
+
+  // Check if the accelerometer wants to interrupt
+//  byte tapped = 0, shaked = 0;
+//  if (!digitalRead(DPIN_ACC_INT)) {
+//    Wire.beginTransmission(ACC_ADDRESS);
+//    Wire.write(ACC_REG_TILT);
+//    Wire.endTransmission(false);       // End, but do not stop!
+//    Wire.requestFrom(ACC_ADDRESS, 1);  // This one stops.
+//    byte tilt = Wire.read();
+//
+//    if (time-lastAccTime > 500) {
+//      lastAccTime = time;
+//
+//      tapped = !!(tilt & 0x20);
+//      shaked = !!(tilt & 0x80);
+//
+//      if (tapped) Serial.println("Tap!");
+//      if (shaked) Serial.println("Shake!");
+//    }
+//  }
 }
 
 
@@ -230,32 +269,45 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
   PT_END(pt);
 }
 
-PT_THREAD(power_pt_func(struct pt *pt))
+PT_THREAD(button_led_pt_func(struct pt *pt))
 {
-  const unsigned long time = millis();
-  int chargeState;
   PT_BEGIN(pt);
 
   do {
-    // Check the state of the charge controller
-    chargeState = analogRead(APIN_CHARGE);
-
-    if (chargeState < 128) {  // Low - charging
-      // Smoothly pulse the green LED over a two-second interval,
-      // as if it were "breathing". This is the charging indication.
-      byte pulse = ((time>>2)&0xFF);
-      pulse = ((pulse * pulse) >> 8);
-      analogWrite(DPIN_GLED, ((time>>2)&0x0100)?0xFF-pulse:pulse);
-
-    } else if (chargeState > 768) {  // High - fully charged.
+    switch(batt_state) {
+    case BATT_CHARGING:
+      {
+        const unsigned long pulseTime = time_current;
+        // Smoothly pulse the green LED over a two-second interval,
+        // as if it were "breathing". This is the charging indication.
+        byte pulse = ((pulseTime>>2)&0xFF);
+        pulse = ((pulse * pulse) >> 8);
+        pulse = ((pulseTime>>2)&0x0100)?0xFF-pulse:pulse;
+        analogWrite(DPIN_GLED, pulse);
+      }
+      break;
+    case BATT_CHARGED:
       // Solid green LED.
       analogWrite(DPIN_GLED, 255);
       digitalWrite(DPIN_GLED, HIGH);
-    } else {  // Hi-Z - Not charging, not pulged in.
+      break;
+    case BATT_DISCHARGING:
       // Blink the indicator LED now and then.
-      digitalWrite(DPIN_GLED, (time&0x03FF)?LOW:HIGH);
+      digitalWrite(DPIN_GLED, (time_current&0x03FF)?LOW:HIGH);
+      break;
     }
+    PT_YIELD(pt);
+  } while(1);
 
+  PT_END(pt);
+}
+
+PT_THREAD(power_pt_func(struct pt *pt))
+{
+  PT_BEGIN(pt);
+
+  overtemp_max = 255;
+  do {
     // Check the temperature sensor
     {
       static bool low_power_condition = false;
@@ -285,19 +337,23 @@ PT_THREAD(power_pt_func(struct pt *pt))
       }
 
       static unsigned long lastStatTime;
-      if(time-lastStatTime > 1000) {
-        while(time-lastStatTime > 1000)
+      if(time_current-lastStatTime > 1000) {
+        while(time_current-lastStatTime > 1000)
           lastStatTime += 1000;
 
         Serial.print("stat: ");
-        Serial.print(time);
+        Serial.print(time_current);
 
-        if (chargeState < 128) {  // Low - charging
+        switch(batt_state) {
+        case BATT_CHARGING:
           Serial.print(" [CHARGING]");
-        } else if (chargeState > 768) {  // High - fully charged.
+          break;
+        case BATT_CHARGED:
           Serial.print(" [CHARGED]");
-        } else {  // Hi-Z - Not charging, not pulged in.
+          break;
+        case BATT_DISCHARGING:
           Serial.print(" [BATTERY]");
+          break;
         }
 
         Serial.print(" duty=");
@@ -311,7 +367,7 @@ PT_THREAD(power_pt_func(struct pt *pt))
         Serial.print("mv");
 
         Serial.print(" Temp=");
-        Serial.print((temp_filtered-500.0f)/10.0f);
+        Serial.print((temp_filtered-500)/10.0f);
         Serial.print("C");
 
         if(overtemp_max!=255) {
@@ -330,8 +386,6 @@ PT_THREAD(power_pt_func(struct pt *pt))
 
 PT_THREAD(light_momentary_pt_func(struct pt *pt))
 {
-  unsigned long time = millis();
-
   // If more than two minutes go by without the user
   // pressing a button, then go ahead and shut down.
   if(button_released_duration > 120000) {
@@ -358,17 +412,15 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
 
 PT_THREAD(light_blinky_pt_func(struct pt *pt))
 {
-  unsigned long time = millis();
-
   PT_BEGIN(pt);
 
-  PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 10));
+  PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > BUTTON_DEBOUNCE));
   button_pressed_duration = 0;
 
   do {
-    amount_off = !((time&(255))<64);
+    amount_off = !((time_current&(255))<64);
     PT_YIELD(pt);
-  } while(amount_current && (button_pressed_duration<10));
+  } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
   amount_off = 0;
   PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
@@ -378,11 +430,29 @@ PT_THREAD(light_blinky_pt_func(struct pt *pt))
 
 PT_THREAD(light_knob_pt_func(struct pt *pt))
 {
-  unsigned long time = millis();
   static unsigned long lastTime;
   static float lastKnobAngle, knob;
 
   PT_BEGIN(pt);
+
+  // Configure accelerometer
+  static const byte config[] = {
+    ACC_REG_INTS,  // First register (see next line)
+    0xE4,  // Interrupts: shakes, taps
+    0x00,  // Mode: not enabled yet
+    0x00,  // Sample rate: 120 Hz
+    0x0F,  // Tap threshold
+    0x10   // Tap debounce samples
+  };
+  Wire.beginTransmission(ACC_ADDRESS);
+  Wire.write(config, sizeof(config));
+  Wire.endTransmission();
+
+  // Enable accelerometer
+  static const byte enable[] = {ACC_REG_MODE, 0x01};  // Mode: active!
+  Wire.beginTransmission(ACC_ADDRESS);
+  Wire.write(enable, sizeof(enable));
+  Wire.endTransmission();
 
   // If we aren't running the driver in 'high' mode,
   // then go ahead and set it to high mode. Also adjust
@@ -432,7 +502,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     if (bright < 4) bright = 4;
 
     fade_to_amount(bright,50);
-  } while(amount_current && (button_pressed_duration<10));
+  } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
   PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
 
@@ -441,9 +511,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
 
 PT_THREAD(light_pt_func(struct pt *pt))
 {
-  unsigned long time = millis();
   static unsigned long lastTime;
-  static unsigned long debounceTime;
   static byte level;
 
   PT_BEGIN(pt);
@@ -469,12 +537,12 @@ PT_THREAD(light_pt_func(struct pt *pt))
     }
   }
 
-  button_released_time = time;
+  button_released_time = time_current;
   button_released_duration = 0;
 
   Serial.println("Starting light thread.");
   do {
-    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > 20));
+    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > BUTTON_DEBOUNCE));
 
     if(!amount_current || (button_released_duration<BUTTON_BRIGHTNESS_THRESHOLD)) {
       level++;
@@ -498,21 +566,20 @@ PT_THREAD(light_pt_func(struct pt *pt))
     case 1:
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, HIGH);
-
       digitalWrite(DPIN_DRV_MODE, LOW);
       fade_to_amount(64,250);
       break;
+
     case 2:
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, HIGH);
-
       digitalWrite(DPIN_DRV_MODE, LOW);
       fade_to_amount(255,500);
       break;
+
     case 3:
       pinMode(DPIN_PWR, OUTPUT);
       digitalWrite(DPIN_PWR, HIGH);
-
       if(!digitalRead(DPIN_DRV_MODE)) {
         set_amount(amount_current/4);
         digitalWrite(DPIN_DRV_MODE, HIGH);
@@ -521,7 +588,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
       break;
     }
 
-    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > 20));
+    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > BUTTON_DEBOUNCE));
 
     if(!level)
       fade_to_amount(0,500);
@@ -564,57 +631,32 @@ setup(void)
   Serial.begin(9600);
   Wire.begin();
 
-  // Configure accelerometer
-  byte config[] = {
-    ACC_REG_INTS,  // First register (see next line)
-    0xE4,  // Interrupts: shakes, taps
-    0x00,  // Mode: not enabled yet
-    0x00,  // Sample rate: 120 Hz
-    0x0F,  // Tap threshold
-    0x10   // Tap debounce samples
-  };
-  Wire.beginTransmission(ACC_ADDRESS);
-  Wire.write(config, sizeof(config));
-  Wire.endTransmission();
-
-  // Enable accelerometer
-  byte enable[] = {ACC_REG_MODE, 0x01};  // Mode: active!
-  Wire.beginTransmission(ACC_ADDRESS);
-  Wire.write(enable, sizeof(enable));
-  Wire.endTransmission();
-  
-  Serial.println("Powered up!");
-
   button_released_time = millis();
   button_pressed_time = millis();
 
-  int chargeState = analogRead(APIN_CHARGE);
+  update_loop_variables();
+  update_loop_variables();
+  update_loop_variables();
 
   // Don't bother loading the settings if we are connected to USB.
   // Only load the settings when we are running from the battery.
-  if ((chargeState >= 128) && (chargeState <= 768)) {
+  if (batt_state == BATT_DISCHARGING) {
     retrieve_settings();
   }
 
-  update_loop_variables();
-  update_loop_variables();
-  update_loop_variables();
+  Serial.println("Powered up!");
 }
 
 void
 loop(void)
 {
-  static unsigned long lastTime, lastTempTime, lastAccTime;
-  static float lastKnobAngle, knob;
-  static byte blink;
+  static unsigned long lastTime;
   unsigned long time = millis();
 
   // Reset the watchdog timer
   wdt_reset();
 
   update_loop_variables();
-
-
 
   // Check the serial port
   if(Serial.available()) {
@@ -650,6 +692,9 @@ loop(void)
         Serial.print("Temperature = ");
         Serial.println(temperature);
 
+        Serial.print("temp_current = ");
+        Serial.println(temp_current);
+
         char accel[3];
         readAccel(accel);
         Serial.print("Acceleration = ");
@@ -663,26 +708,8 @@ loop(void)
     }
   }
 
-  // Check if the accelerometer wants to interrupt
-//  byte tapped = 0, shaked = 0;
-//  if (!digitalRead(DPIN_ACC_INT)) {
-//    Wire.beginTransmission(ACC_ADDRESS);
-//    Wire.write(ACC_REG_TILT);
-//    Wire.endTransmission(false);       // End, but do not stop!
-//    Wire.requestFrom(ACC_ADDRESS, 1);  // This one stops.
-//    byte tilt = Wire.read();
-//
-//    if (time-lastAccTime > 500) {
-//      lastAccTime = time;
-//
-//      tapped = !!(tilt & 0x20);
-//      shaked = !!(tilt & 0x80);
-//
-//      if (tapped) Serial.println("Tap!");
-//      if (shaked) Serial.println("Shake!");
-//    }
-//  }
 
+  button_led_pt_func(&button_led_pt);
   power_pt_func(&power_pt);
   fade_control_pt_func(&fade_control_pt);
 
