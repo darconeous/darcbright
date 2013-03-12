@@ -12,6 +12,33 @@
 **
 ** TODO:
 **  * Debounce power-on button press.
+**
+**
+*/
+
+/*
+Accelorometer axies:
+
+(x,y,z)
+
+If the flashlight is facing straight up:
+  (0, 21, 0)
+
+If the flashlight is facing straight down:
+  (0, -21, 0)
+
+If the flashlight is battery-up:
+  (0, 0, -21)
+
+If the flashlight is battery-down:
+  (0, 0, 21)
+
+If the flashlight is logo-up:
+  (-21, 0, 0)
+
+If the flashlight is logo-down:
+  (21, 0, 0)
+
 */
 
 #include <math.h>
@@ -90,6 +117,8 @@ enum {
     BATT_CHARGED,
 } batt_state;
 unsigned long time_current;
+float angle_pitch;
+float angle_roll;
 
 #define PT_WAIT_FOR_PERIOD(pt,x) \
     lastTime =  time_current; \
@@ -128,6 +157,13 @@ update_loop_variables(void) {
     batt_state = BATT_CHARGED;
   } else {  // Hi-Z - Not charging, not pulged in.
     batt_state = BATT_DISCHARGING;
+  }
+
+  {
+    char acc[3];
+    readAccelFiltered(acc);
+    angle_roll = atan2(acc[0],acc[2]);
+    angle_pitch = atan2(acc[1],sqrt(acc[0]*acc[0]+acc[2]*acc[2]));
   }
 
   // Check if the accelerometer wants to interrupt
@@ -200,6 +236,14 @@ void readAccelFiltered(char *acc_filtered) {
   acc_filtered[2] = median_char(acc[0][2],acc[1][2],acc[2][2]);
 }
 
+
+//float readAccelAngleXZ()
+//{
+//  char acc[3];
+//  readAccelFiltered(acc);
+//  return atan2(acc[0],acc[2]);
+//}
+
 /* Returns the median value of the given three parameters */
 char median_char(char a, char b, char c) {
     if(a<c) {
@@ -234,13 +278,6 @@ short median_short(short a, short b, short c) {
     return b;
 }
 
-
-float readAccelAngleXZ()
-{
-  char acc[3];
-  readAccelFiltered(acc);
-  return atan2(acc[0],acc[2]);
-}
 
 void
 retrieve_settings(void) {
@@ -445,6 +482,12 @@ PT_THREAD(power_pt_func(struct pt *pt))
         Serial.print((temp_filtered-500)/10.0f);
         Serial.print("C");
 
+        Serial.print(" roll=");
+        Serial.print(angle_roll);
+
+        Serial.print(" pitch=");
+        Serial.print(angle_pitch);
+
         if(overtemp_max!=255) {
           Serial.print(" THRTTL=");
           Serial.print(overtemp_max);
@@ -546,21 +589,15 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   // Wait for a brief moment for any vibrations to stabalize.
   PT_WAIT_FOR_PERIOD(pt,50);
 
-  // We read this three times to make sure our filtering has stabalized.
-  lastKnobAngle = readAccelAngleXZ();
-  lastKnobAngle = readAccelAngleXZ();
-  lastKnobAngle = readAccelAngleXZ();
+  lastKnobAngle = angle_pitch;
 
   do {
     PT_WAIT_FOR_PERIOD(pt,50);
-    float angle = readAccelAngleXZ();
-    float change = angle - lastKnobAngle;
-    lastKnobAngle = angle;
+    float change = angle_roll - lastKnobAngle;
+    lastKnobAngle = angle_roll;
 
     // Don't bother updating our brightness reading if our angle isn't good.
-    char acc[3];
-    readAccelFiltered(acc);
-    if(acc[0]*acc[0] + acc[2]*acc[2] > 14*14) {
+    if(abs(angle_pitch) < PI*0.25) {
       if (change >  PI) change -= 2.0f*PI;
       if (change < -PI) change += 2.0f*PI;
       knob += -change * 40.0f;
@@ -771,7 +808,7 @@ loop(void)
         Serial.println(temp_current);
 
         char accel[3];
-        readAccel(accel);
+        readAccelFiltered(accel);
         Serial.print("Acceleration = ");
         Serial.print(accel[0], DEC);
         Serial.print(", ");
