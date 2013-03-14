@@ -48,7 +48,7 @@ If the flashlight is logo-down:
 #include <avr/wdt.h>
 
 // Settings
-#define VOLTAGE_NOMINAL               3400
+#define VOLTAGE_NOMINAL               3330
 #define VOLTAGE_LOW                   3100
 #define OVERTEMP_SHUTDOWN_C           70
 #define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
