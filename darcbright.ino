@@ -101,6 +101,7 @@ struct pt light_blinky_pt;
 struct pt light_knob_pt;
 
 // Variables updated every loop
+bool button_is_pressed;
 unsigned long button_pressed_time;
 unsigned long button_released_time;
 unsigned long button_pressed_duration;
@@ -140,7 +141,11 @@ update_loop_variables(void) {
 
   time_current = millis();
 
-  if(digitalRead(DPIN_RLED_SW)) {
+  bool prev_value = digitalRead(DPIN_RLED_SW);
+  pinMode(DPIN_RLED_SW,  INPUT);
+  digitalWrite(DPIN_RLED_SW, 0);
+  button_is_pressed = digitalRead(DPIN_RLED_SW);
+  if(button_is_pressed) {
     button_released_time = time_current;
     button_pressed_duration = time_current - button_pressed_time;
   } else {
@@ -148,6 +153,8 @@ update_loop_variables(void) {
     button_released_duration = time_current - button_released_time;
     button_pressed_duration = 0;
   }
+  pinMode(DPIN_RLED_SW,  OUTPUT);
+  digitalWrite(prev_value, 1);
 
   short chargeState = analogRead(APIN_CHARGE);
 
@@ -405,7 +412,13 @@ PT_THREAD(button_led_pt_func(struct pt *pt))
       break;
     case BATT_DISCHARGING:
       // Blink the indicator LED now and then.
-      digitalWrite(DPIN_GLED, (time_current&0x03FF)?LOW:HIGH);
+      if(overtemp_max!=255) {
+        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>10?LOW:HIGH);
+        digitalWrite(DPIN_GLED, LOW);
+      } else {
+        digitalWrite(DPIN_GLED, (time_current&0x03FF)>10?LOW:HIGH);
+        digitalWrite(DPIN_RLED_SW, LOW);
+      }
       break;
     }
     PT_YIELD(pt);
@@ -518,11 +531,11 @@ PT_THREAD(light_momentary_pt_func(struct pt *pt))
     digitalWrite(DPIN_PWR, HIGH);
     amount_off = 0;
 
-    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW));
+    PT_WAIT_UNTIL(pt, !button_is_pressed);
 
     amount_off = 1;
 
-    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW));
+    PT_WAIT_UNTIL(pt, button_is_pressed);
   } while(amount_current);
 
   PT_END(pt);
@@ -532,7 +545,7 @@ PT_THREAD(light_blinky_pt_func(struct pt *pt))
 {
   PT_BEGIN(pt);
 
-  PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > BUTTON_DEBOUNCE));
+  PT_WAIT_UNTIL(pt, !button_is_pressed && (button_released_duration > BUTTON_DEBOUNCE));
   button_pressed_duration = 0;
 
   do {
@@ -541,7 +554,7 @@ PT_THREAD(light_blinky_pt_func(struct pt *pt))
   } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
   amount_off = 0;
-  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
+  PT_WAIT_UNTIL(pt,!button_is_pressed);
 
   PT_END(pt);
 }
@@ -584,20 +597,22 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   knob = sqrt((float)amount_current/255.0f)*255.0f;
 
   // Wait for the user to let go of the button.
-  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
+  PT_WAIT_UNTIL(pt,!button_is_pressed);
 
   // Wait for a brief moment for any vibrations to stabalize.
   PT_WAIT_FOR_PERIOD(pt,50);
 
-  lastKnobAngle = angle_pitch;
+  lastKnobAngle = angle_roll;
 
   do {
     PT_WAIT_FOR_PERIOD(pt,50);
     float change = angle_roll - lastKnobAngle;
     lastKnobAngle = angle_roll;
 
+#define DEG_TO_RAD(x)    ((PI*(x))/180.0f)
+
     // Don't bother updating our brightness reading if our angle isn't good.
-    if(abs(angle_pitch) < PI*0.25) {
+    if(abs(angle_pitch) < DEG_TO_RAD(60)) {
       if (change >  PI) change -= 2.0f*PI;
       if (change < -PI) change += 2.0f*PI;
       knob += -change * 40.0f;
@@ -608,15 +623,16 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     // Make apparent brightness changes linear by squaring the
     // value and dividing back down into range.  This gives us
     // a gamma correction of 2.0, which is close enough.
-    byte bright = (long)(knob * knob) >> 8;
+    byte bright = (uint16_t)(knob * knob) >> 8;
 
     // Avoid ever appearing off in this mode!
     if (bright < 4) bright = 4;
 
-    fade_to_amount(bright,50);
+    if((amount_current != amount_end) || abs((int8_t)(amount_end-bright)) > 1)
+      fade_to_amount(bright,100);
   } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
-  PT_WAIT_UNTIL(pt,!digitalRead(DPIN_RLED_SW));
+  PT_WAIT_UNTIL(pt,!button_is_pressed);
 
   PT_END(pt);
 }
@@ -654,7 +670,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
 
   Serial.println("Starting light thread.");
   do {
-    PT_WAIT_UNTIL(pt, digitalRead(DPIN_RLED_SW) && (button_pressed_duration > BUTTON_DEBOUNCE));
+    PT_WAIT_UNTIL(pt, button_is_pressed && (button_pressed_duration > BUTTON_DEBOUNCE));
 
     if(!amount_current || (button_released_duration<BUTTON_BRIGHTNESS_THRESHOLD)) {
       level++;
@@ -700,7 +716,7 @@ PT_THREAD(light_pt_func(struct pt *pt))
       break;
     }
 
-    PT_WAIT_UNTIL(pt, !digitalRead(DPIN_RLED_SW) && (button_released_duration > BUTTON_DEBOUNCE));
+    PT_WAIT_UNTIL(pt, !button_is_pressed && (button_released_duration > BUTTON_DEBOUNCE));
 
     if(!level)
       fade_to_amount(0,500);
