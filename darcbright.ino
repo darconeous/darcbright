@@ -55,6 +55,7 @@ If the flashlight is logo-down:
 #define OVERTEMP_THROTTLE             (long)(OVERTEMP_SHUTDOWN-250)
 #define BUTTON_BRIGHTNESS_THRESHOLD   1000 // time in ms, after which a button press turns off
 #define BUTTON_DEBOUNCE               20
+#define POWER_ON_BUTTON_THRESHOLD     150 // Period of time button initially needs to be held to keep the light on.
 
 // Constants
 #define ACC_ADDRESS             0x4C
@@ -323,7 +324,10 @@ set_amount(byte amount) {
   amount_off = 0;
   analogWrite(DPIN_DRV_EN,amount_current);
   pinMode(DPIN_PWR, OUTPUT);
-  digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
+  if(time_current<POWER_ON_BUTTON_THRESHOLD || amount_current==0)
+    digitalWrite(DPIN_PWR, LOW);
+  else
+    digitalWrite(DPIN_PWR, HIGH);
 }
 
 void
@@ -365,15 +369,16 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
     if(fade_time >= amount_fade_duration) {
       if(amount_current != amount_end) {
         amount_current = amount_end;
-
-        pinMode(DPIN_PWR, OUTPUT);
-        digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
       }
     } else {
       amount_current = (((long)amount_end - (long)amount_begin)*fade_time)/amount_fade_duration + amount_begin;
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, amount_current==0?LOW:HIGH);
     }
+
+    pinMode(DPIN_PWR, OUTPUT);
+    if(time_current<POWER_ON_BUTTON_THRESHOLD || amount_current==0)
+      digitalWrite(DPIN_PWR, LOW);
+    else
+      digitalWrite(DPIN_PWR, HIGH);
 
     if(amount_current>overtemp_max) {
       amount_current = overtemp_max;
@@ -692,22 +697,22 @@ PT_THREAD(light_pt_func(struct pt *pt))
       //fade_to_amount(0,500);
       break;
     case 1:
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
+//      pinMode(DPIN_PWR, OUTPUT);
+//      digitalWrite(DPIN_PWR, HIGH);
       digitalWrite(DPIN_DRV_MODE, LOW);
       fade_to_amount(64,250);
       break;
 
     case 2:
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
+//      pinMode(DPIN_PWR, OUTPUT);
+//      digitalWrite(DPIN_PWR, HIGH);
       digitalWrite(DPIN_DRV_MODE, LOW);
       fade_to_amount(255,500);
       break;
 
     case 3:
-      pinMode(DPIN_PWR, OUTPUT);
-      digitalWrite(DPIN_PWR, HIGH);
+//      pinMode(DPIN_PWR, OUTPUT);
+//      digitalWrite(DPIN_PWR, HIGH);
       if(!digitalRead(DPIN_DRV_MODE)) {
         set_amount(amount_current/4);
         digitalWrite(DPIN_DRV_MODE, HIGH);
