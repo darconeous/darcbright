@@ -441,6 +441,7 @@ PT_THREAD(power_pt_func(struct pt *pt))
     // Check the temperature sensor
     {
       static bool low_power_condition = false;
+      static uint8_t anti_flicker = 255;
 
       if(temp_filtered > OVERTEMP_SHUTDOWN) {
         if(amount_current)
@@ -459,12 +460,20 @@ PT_THREAD(power_pt_func(struct pt *pt))
           overtemp_max++;
         digitalWrite(DPIN_DRV_MODE,LOW);
       } else {
-        if(overtemp_max != 255)
-          overtemp_max++;
+        if(anti_flicker == 255) {
+          if(overtemp_max != 255)
+            overtemp_max++;
+        } else {
+          anti_flicker++;
+        }
       }
 
       if(temp_filtered > OVERTEMP_THROTTLE) {
-        overtemp_max = min(overtemp_max,(OVERTEMP_SHUTDOWN - temp_filtered));
+        uint8_t new_max = (OVERTEMP_SHUTDOWN - temp_filtered);
+        if(overtemp_max>new_max) {
+          overtemp_max = new_max;
+          anti_flicker = 0;
+        }
       }
 
       static unsigned long lastStatTime;
