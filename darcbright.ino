@@ -52,7 +52,7 @@ If the flashlight is logo-down:
 #define VOLTAGE_LOW                   3100
 #define OVERTEMP_SHUTDOWN_C           70
 #define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
-#define OVERTEMP_THROTTLE             (long)(OVERTEMP_SHUTDOWN-250)
+#define OVERTEMP_THROTTLE             (long)(OVERTEMP_SHUTDOWN-254)
 #define BUTTON_BRIGHTNESS_THRESHOLD   1000 // time in ms, after which a button press turns off
 #define BUTTON_DEBOUNCE               20
 #define POWER_ON_BUTTON_THRESHOLD     150 // Period of time button initially needs to be held to keep the light on.
@@ -459,7 +459,8 @@ PT_THREAD(power_pt_func(struct pt *pt))
           overtemp_max++;
         digitalWrite(DPIN_DRV_MODE,LOW);
       } else {
-        overtemp_max = 255;
+        if(overtemp_max != 255)
+          overtemp_max++;
       }
 
       if(temp_filtered > OVERTEMP_THROTTLE) {
