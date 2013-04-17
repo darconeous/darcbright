@@ -57,6 +57,13 @@ If the flashlight is logo-down:
 #define BUTTON_DEBOUNCE               20
 #define POWER_ON_BUTTON_THRESHOLD     150 // Period of time button initially needs to be held to keep the light on.
 
+#define BRT_MIN_LUMEN          4
+#define BRT_MED_LUMEN          255                        // 175 lumens
+#define BRT_LOW_LUMEN          (BRT_MED_LUMEN/4)            // 43 lumens
+#define BRT_MAX_LUMEN          (BRT_MED_LUMEN+(3*255))    // 500 lumens
+
+
+
 // Constants
 #define ACC_ADDRESS             0x4C
 #define ACC_REG_XOUT            0
@@ -81,11 +88,11 @@ If the flashlight is logo-down:
 #define INT_ACC                 1
 
 // State
-byte overtemp_max;
 byte light_mode;
-byte amount_current;
-byte amount_begin;
-byte amount_end;
+unsigned short overtemp_max;
+unsigned short amount_current;
+unsigned short amount_begin;
+unsigned short amount_end;
 unsigned short amount_fade_duration;
 unsigned long amount_fade_start;
 byte amount_flash,amount_off;
@@ -295,10 +302,9 @@ retrieve_settings(void) {
   data[2] = EEPROM.read(2);
   data[3] = EEPROM.read(3);
   if(data[0] == (byte)~(data[1]^data[2]^data[3] + sizeof(data))) {
-    light_mode = data[2];
+    light_mode = data[1];
     if(light_mode) {
-      set_amount(data[1]);
-      digitalWrite(DPIN_DRV_MODE,data[3]);
+      set_amount(data[2]+((unsigned short)data[3]<<8));
     }
     Serial.println("Settings retrieved");
   }
@@ -307,9 +313,9 @@ retrieve_settings(void) {
 void
 save_settings(void) {
   byte data[4];
-  data[1] = amount_current;
-  data[2] = light_mode;
-  data[3] = digitalRead(DPIN_DRV_MODE);
+  data[1] = light_mode;
+  data[2] = (byte)amount_current;
+  data[3] = (amount_current>>8);
   data[0] = ~(data[1]^data[2]^data[3] + sizeof(data));
   EEPROM.write(0,data[0]);
   EEPROM.write(1,data[1]);
@@ -317,12 +323,27 @@ save_settings(void) {
   EEPROM.write(3,data[3]);
 }
 
+void set_brightness(unsigned short b) {
+  if(b<=255) {
+    digitalWrite(DPIN_DRV_MODE, LOW);
+    analogWrite(DPIN_DRV_EN, b);
+  } else if(b<=BRT_MAX_LUMEN) {
+
+    analogWrite(DPIN_DRV_MODE, ((long)b-BRT_MED_LUMEN)*255/((long)BRT_MAX_LUMEN-BRT_MED_LUMEN));
+    digitalWrite(DPIN_DRV_EN, HIGH);
+  } else {
+    digitalWrite(DPIN_DRV_EN, HIGH);
+    digitalWrite(DPIN_DRV_MODE, HIGH);
+  }
+}
+
 void
 set_amount(byte amount) {
   amount_current = amount_begin = amount_end = amount;
   amount_fade_duration = 0;
   amount_off = 0;
-  analogWrite(DPIN_DRV_EN,amount_current);
+
+  set_brightness(amount_current);
   pinMode(DPIN_PWR, OUTPUT);
   if(time_current<POWER_ON_BUTTON_THRESHOLD || amount_current==0)
     digitalWrite(DPIN_PWR, LOW);
@@ -331,15 +352,7 @@ set_amount(byte amount) {
 }
 
 void
-fade_to_amount(byte amount, unsigned short fade_duration) {
-  if((amount == 0) && (amount_current < 64) && digitalRead(DPIN_DRV_MODE)) {
-    // Automatically fall back to "low" mode on the driver when
-    // we are already dim and fading to black. This helps make the transition
-    // appear more smooth.
-    amount_current *= 4;
-    digitalWrite(DPIN_DRV_MODE,LOW);
-    analogWrite(DPIN_DRV_EN,amount_current);
-  }
+fade_to_amount(unsigned short amount, unsigned short fade_duration) {
   amount_begin = amount_current;
   amount_end = amount;
   amount_fade_duration = fade_duration;
@@ -384,10 +397,7 @@ PT_THREAD(fade_control_pt_func(struct pt *pt))
       amount_current = overtemp_max;
     }
 
-    analogWrite(DPIN_DRV_EN, amount_off?0:amount_current);
-
-    if(!amount_current)
-      digitalWrite(DPIN_DRV_MODE, LOW);
+    set_brightness(amount_off?0:amount_current);
   } while(1);
 
   PT_END(pt);
@@ -436,7 +446,7 @@ PT_THREAD(power_pt_func(struct pt *pt))
 {
   PT_BEGIN(pt);
 
-  overtemp_max = 255;
+  overtemp_max = BRT_MAX_LUMEN;
   do {
     // Check the temperature sensor
     {
@@ -453,15 +463,19 @@ PT_THREAD(power_pt_func(struct pt *pt))
       }
 
       if(low_power_condition || (vcc_current<VOLTAGE_LOW)) {
+        if(!low_power_condition) {
+          digitalWrite(DPIN_DRV_MODE, LOW);
+          digitalWrite(DPIN_DRV_EN, LOW);
+          overtemp_max = amount_current/2 + BRT_MIN_LUMEN;
+        }
         low_power_condition = true;
-        if((vcc_filtered < VOLTAGE_LOW) && (overtemp_max > 4))
-          overtemp_max--;
-        if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != 255))
+        if((vcc_filtered < VOLTAGE_LOW) && (overtemp_max > BRT_LOW_LUMEN))
+          overtemp_max -= BRT_LOW_LUMEN;
+        if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != BRT_MAX_LUMEN))
           overtemp_max++;
-        digitalWrite(DPIN_DRV_MODE,LOW);
       } else {
         if(anti_flicker == 255) {
-          if(overtemp_max != 255)
+          if(overtemp_max != BRT_MAX_LUMEN)
             overtemp_max++;
         } else {
           anti_flicker++;
@@ -469,9 +483,9 @@ PT_THREAD(power_pt_func(struct pt *pt))
       }
 
       if(temp_filtered > OVERTEMP_THROTTLE) {
-        uint8_t new_max = (OVERTEMP_SHUTDOWN - temp_filtered);
+        unsigned short new_max = ((OVERTEMP_THROTTLE+254-temp_filtered)<<2);
         if(overtemp_max>new_max) {
-          overtemp_max = new_max;
+          overtemp_max--;
           anti_flicker = 0;
         }
       }
@@ -499,9 +513,6 @@ PT_THREAD(power_pt_func(struct pt *pt))
         Serial.print(" duty=");
         Serial.print(amount_current);
 
-        Serial.print(" mode=");
-        Serial.print(digitalRead(DPIN_DRV_MODE)?"hi":"low");
-
         Serial.print(" Vcc=");
         Serial.print(vcc_filtered);
         Serial.print("mv");
@@ -516,7 +527,7 @@ PT_THREAD(power_pt_func(struct pt *pt))
         Serial.print(" pitch=");
         Serial.print(angle_pitch);
 
-        if(overtemp_max!=255) {
+        if(overtemp_max<BRT_MAX_LUMEN) {
           Serial.print(" THRTTL=");
           Serial.print(overtemp_max);
         }
@@ -603,13 +614,13 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   // If we aren't running the driver in 'high' mode,
   // then go ahead and set it to high mode. Also adjust
   // the amount so that it is as close as possible in brightness.
-  if(!digitalRead(DPIN_DRV_MODE)) {
-    set_amount(amount_current/4);
-    digitalWrite(DPIN_DRV_MODE, HIGH);
-  }
+//  if(!digitalRead(DPIN_DRV_MODE)) {
+//    set_amount(amount_current/4);
+//    digitalWrite(DPIN_DRV_MODE, HIGH);
+//  }
 
   // Set the initial knob value based on our current light bightness level.
-  knob = sqrt((float)amount_current/255.0f)*255.0f;
+  knob = sqrt((float)amount_current/(float)BRT_MAX_LUMEN);
 
   // Wait for the user to let go of the button.
   PT_WAIT_UNTIL(pt,!button_is_pressed);
@@ -630,20 +641,20 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
     if(abs(angle_pitch) < DEG_TO_RAD(60)) {
       if (change >  PI) change -= 2.0f*PI;
       if (change < -PI) change += 2.0f*PI;
-      knob += -change * 40.0f;
-      if (knob < 0)   knob = 0;
-      if (knob > 255) knob = 255;
+      knob += change / -7.0f;
+      if (knob < 0) knob = 0;
+      if (knob > 1) knob = 1;
     }
 
     // Make apparent brightness changes linear by squaring the
     // value and dividing back down into range.  This gives us
     // a gamma correction of 2.0, which is close enough.
-    byte bright = (uint16_t)(knob * knob) >> 8;
+    unsigned short bright = (uint16_t)(knob * knob * BRT_MAX_LUMEN);
 
     // Avoid ever appearing off in this mode!
-    if (bright < 4) bright = 4;
+    if (bright < BRT_MIN_LUMEN) bright = BRT_MIN_LUMEN;
 
-    if((amount_current != amount_end) || abs((int8_t)(amount_end-bright)) > 1)
+    if((amount_current != amount_end) || abs((int16_t)(amount_end-bright)) > 4)
       fade_to_amount(bright,100);
   } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
@@ -660,24 +671,14 @@ PT_THREAD(light_pt_func(struct pt *pt))
   PT_BEGIN(pt);
 
   // Estimate what the current brighness level is closest to.
-  if(digitalRead(DPIN_DRV_MODE)) {
-    if(amount_current <= 8) {
-      level = 0;
-    } else if(amount_current <= 32) {
-      level = 1;
-    } else if(amount_current <= 128) {
-      level = 2;
-    } else {
-      level = 3;
-    }
+  if(amount_current < (BRT_LOW_LUMEN/2)) {
+    level = 0;
+  } else if(amount_current < (BRT_MED_LUMEN/2)) {
+    level = 1;
+  } else if(amount_current < (BRT_MAX_LUMEN/2)) {
+    level = 2;
   } else {
-    if(amount_current <= 32) {
-      level = 0;
-    } else if(amount_current <= 128) {
-      level = 1;
-    } else {
-      level = 2;
-    }
+    level = 3;
   }
 
   button_released_time = time_current;
@@ -699,35 +700,18 @@ PT_THREAD(light_pt_func(struct pt *pt))
 
     switch(level) {
     case 0:
-      //pinMode(DPIN_PWR, OUTPUT);
-      //digitalWrite(DPIN_PWR, LOW);
-      //digitalWrite(DPIN_DRV_MODE, LOW);
-      //analogWrite(DPIN_DRV_EN, 0);
-
-      //fade_to_amount(0,500);
       break;
+
     case 1:
-//      pinMode(DPIN_PWR, OUTPUT);
-//      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      fade_to_amount(64,250);
+      fade_to_amount(BRT_LOW_LUMEN,250);
       break;
 
     case 2:
-//      pinMode(DPIN_PWR, OUTPUT);
-//      digitalWrite(DPIN_PWR, HIGH);
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      fade_to_amount(255,500);
+      fade_to_amount(BRT_MED_LUMEN,500);
       break;
 
     case 3:
-//      pinMode(DPIN_PWR, OUTPUT);
-//      digitalWrite(DPIN_PWR, HIGH);
-      if(!digitalRead(DPIN_DRV_MODE)) {
-        set_amount(amount_current/4);
-        digitalWrite(DPIN_DRV_MODE, HIGH);
-      }
-      fade_to_amount(255,500);
+      fade_to_amount(BRT_MAX_LUMEN,500);
       break;
     }
 
@@ -805,28 +789,18 @@ loop(void)
   if(Serial.available()) {
     char c = Serial.read();
     switch(c) {
-    case 'h':
-      digitalWrite(DPIN_DRV_MODE, HIGH);
-      Serial.println("Driver Mode: HIGH");
-      break;
-
-    case 'l':
-      digitalWrite(DPIN_DRV_MODE, LOW);
-      Serial.println("Driver Mode: LOW");
-      break;
-
     case '+':
-      if(255-amount_current<10)
-        set_amount(255);
+      if(BRT_MAX_LUMEN-amount_current<BRT_MIN_LUMEN)
+        set_amount(BRT_MAX_LUMEN);
       else
-        set_amount(amount_current+10);
+        set_amount(amount_current+BRT_MIN_LUMEN);
       break;
 
     case '-':
-      if(amount_current<10)
+      if(amount_current<BRT_MIN_LUMEN)
         set_amount(0);
       else
-        set_amount(amount_current-10);
+        set_amount(amount_current-BRT_MIN_LUMEN);
       break;
 
     case 's':
