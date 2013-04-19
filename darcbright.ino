@@ -9,10 +9,7 @@
 **  * Accelerometer filtering.
 **  * Mode changing by holding down button. (4 "modes": constant, momentary, blinky, knob)
 **  * Overtemp condition now attempts to throttle back brightness instead of just turning off.
-**
-** TODO:
 **  * Debounce power-on button press.
-**
 **
 */
 
@@ -50,9 +47,10 @@ If the flashlight is logo-down:
 // Settings
 #define VOLTAGE_NOMINAL               3330
 #define VOLTAGE_LOW                   3100
-#define OVERTEMP_SHUTDOWN_C           70
+#define OVERTEMP_SHUTDOWN_C           65
+#define OVERTEMP_THROTTLE_C           45
 #define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
-#define OVERTEMP_THROTTLE             (long)(OVERTEMP_SHUTDOWN-254)
+#define OVERTEMP_THROTTLE             (OVERTEMP_THROTTLE_C*10+500)
 #define BUTTON_BRIGHTNESS_THRESHOLD   1000 // time in ms, after which a button press turns off
 #define BUTTON_DEBOUNCE               20
 #define POWER_ON_BUTTON_THRESHOLD     150 // Period of time button initially needs to be held to keep the light on.
@@ -133,6 +131,35 @@ float angle_roll;
     lastTime =  time_current; \
     PT_WAIT_UNTIL(pt, (time_current-lastTime) > (x));
 
+bool orientation_enabled;
+
+void
+enable_orientation(void) {
+  pinMode(DPIN_ACC_INT,  INPUT);
+  digitalWrite(DPIN_ACC_INT,  HIGH);
+
+  // Configure accelerometer
+  static const byte config[] = {
+    ACC_REG_INTS,  // First register (see next line)
+    0xE4,  // Interrupts: shakes, taps
+    0x00,  // Mode: not enabled yet
+    0x00,  // Sample rate: 120 Hz
+    0x0F,  // Tap threshold
+    0x10   // Tap debounce samples
+  };
+  Wire.beginTransmission(ACC_ADDRESS);
+  Wire.write(config, sizeof(config));
+  Wire.endTransmission();
+
+  // Enable accelerometer
+  static const byte enable[] = {ACC_REG_MODE, 0x01};  // Mode: active!
+  Wire.beginTransmission(ACC_ADDRESS);
+  Wire.write(enable, sizeof(enable));
+  Wire.endTransmission();
+
+  orientation_enabled = 1;
+}
+
 void
 update_loop_variables(void) {
   static char i;
@@ -174,7 +201,7 @@ update_loop_variables(void) {
     batt_state = BATT_DISCHARGING;
   }
 
-  {
+  if(orientation_enabled) {
     char acc[3];
     readAccelFiltered(acc);
     angle_roll = atan2(acc[0],acc[2]);
@@ -252,13 +279,6 @@ void readAccelFiltered(char *acc_filtered) {
 }
 
 
-//float readAccelAngleXZ()
-//{
-//  char acc[3];
-//  readAccelFiltered(acc);
-//  return atan2(acc[0],acc[2]);
-//}
-
 /* Returns the median value of the given three parameters */
 char median_char(char a, char b, char c) {
     if(a<c) {
@@ -328,7 +348,6 @@ void set_brightness(unsigned short b) {
     digitalWrite(DPIN_DRV_MODE, LOW);
     analogWrite(DPIN_DRV_EN, b);
   } else if(b<=BRT_MAX_LUMEN) {
-
     analogWrite(DPIN_DRV_MODE, ((long)b-BRT_MED_LUMEN)*255/((long)BRT_MAX_LUMEN-BRT_MED_LUMEN));
     digitalWrite(DPIN_DRV_EN, HIGH);
   } else {
@@ -338,7 +357,7 @@ void set_brightness(unsigned short b) {
 }
 
 void
-set_amount(byte amount) {
+set_amount(unsigned short amount) {
   amount_current = amount_begin = amount_end = amount;
   amount_fade_duration = 0;
   amount_off = 0;
@@ -422,13 +441,12 @@ PT_THREAD(button_led_pt_func(struct pt *pt))
       break;
     case BATT_CHARGED:
       // Solid green LED.
-      analogWrite(DPIN_GLED, 255);
       digitalWrite(DPIN_GLED, HIGH);
       break;
     case BATT_DISCHARGING:
       // Blink the indicator LED now and then.
-      if(overtemp_max!=255) {
-        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>10?LOW:HIGH);
+      if(overtemp_max<BRT_MAX_LUMEN) {
+        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>30?LOW:HIGH);
         digitalWrite(DPIN_GLED, LOW);
       } else {
         digitalWrite(DPIN_GLED, (time_current&0x03FF)>10?LOW:HIGH);
@@ -464,15 +482,23 @@ PT_THREAD(power_pt_func(struct pt *pt))
 
       if(low_power_condition || (vcc_current<VOLTAGE_LOW)) {
         if(!low_power_condition) {
-          digitalWrite(DPIN_DRV_MODE, LOW);
-          digitalWrite(DPIN_DRV_EN, LOW);
-          overtemp_max = amount_current/2 + BRT_MIN_LUMEN;
+          overtemp_max = amount_current;
         }
         low_power_condition = true;
-        if((vcc_filtered < VOLTAGE_LOW) && (overtemp_max > BRT_LOW_LUMEN))
-          overtemp_max -= BRT_LOW_LUMEN;
-        if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != BRT_MAX_LUMEN))
-          overtemp_max++;
+        if((vcc_filtered < VOLTAGE_LOW) && (overtemp_max > BRT_MIN_LUMEN)) {
+          digitalWrite(DPIN_DRV_EN, LOW);
+          digitalWrite(DPIN_DRV_MODE, LOW);
+          analogWrite(DPIN_DRV_EN,BRT_MIN_LUMEN);
+          overtemp_max = overtemp_max/2 + BRT_MIN_LUMEN;
+          anti_flicker = 0;
+        }
+
+        if(anti_flicker == 255) {
+          if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != BRT_MAX_LUMEN))
+            overtemp_max++;
+        } else {
+          anti_flicker++;
+        }
       } else {
         if(anti_flicker == 255) {
           if(overtemp_max != BRT_MAX_LUMEN)
@@ -521,11 +547,13 @@ PT_THREAD(power_pt_func(struct pt *pt))
         Serial.print((temp_filtered-500)/10.0f);
         Serial.print("C");
 
-        Serial.print(" roll=");
-        Serial.print(angle_roll);
+        if(orientation_enabled) {
+          Serial.print(" roll=");
+          Serial.print(angle_roll);
 
-        Serial.print(" pitch=");
-        Serial.print(angle_pitch);
+          Serial.print(" pitch=");
+          Serial.print(angle_pitch);
+        }
 
         if(overtemp_max<BRT_MAX_LUMEN) {
           Serial.print(" THRTTL=");
@@ -575,7 +603,7 @@ PT_THREAD(light_blinky_pt_func(struct pt *pt))
   button_pressed_duration = 0;
 
   do {
-    amount_off = !((time_current&(255))<64);
+    amount_off = !((time_current&0xFF)<=64) || !((time_current&0x1F)<=16);
     PT_YIELD(pt);
   } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
@@ -592,32 +620,7 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
 
   PT_BEGIN(pt);
 
-  // Configure accelerometer
-  static const byte config[] = {
-    ACC_REG_INTS,  // First register (see next line)
-    0xE4,  // Interrupts: shakes, taps
-    0x00,  // Mode: not enabled yet
-    0x00,  // Sample rate: 120 Hz
-    0x0F,  // Tap threshold
-    0x10   // Tap debounce samples
-  };
-  Wire.beginTransmission(ACC_ADDRESS);
-  Wire.write(config, sizeof(config));
-  Wire.endTransmission();
-
-  // Enable accelerometer
-  static const byte enable[] = {ACC_REG_MODE, 0x01};  // Mode: active!
-  Wire.beginTransmission(ACC_ADDRESS);
-  Wire.write(enable, sizeof(enable));
-  Wire.endTransmission();
-
-  // If we aren't running the driver in 'high' mode,
-  // then go ahead and set it to high mode. Also adjust
-  // the amount so that it is as close as possible in brightness.
-//  if(!digitalRead(DPIN_DRV_MODE)) {
-//    set_amount(amount_current/4);
-//    digitalWrite(DPIN_DRV_MODE, HIGH);
-//  }
+  enable_orientation();
 
   // Set the initial knob value based on our current light bightness level.
   knob = sqrt((float)amount_current/(float)BRT_MAX_LUMEN);
@@ -631,31 +634,35 @@ PT_THREAD(light_knob_pt_func(struct pt *pt))
   lastKnobAngle = angle_roll;
 
   do {
-    PT_WAIT_FOR_PERIOD(pt,50);
-    float change = angle_roll - lastKnobAngle;
-    lastKnobAngle = angle_roll;
-
-#define DEG_TO_RAD(x)    ((PI*(x))/180.0f)
-
-    // Don't bother updating our brightness reading if our angle isn't good.
-    if(abs(angle_pitch) < DEG_TO_RAD(60)) {
-      if (change >  PI) change -= 2.0f*PI;
-      if (change < -PI) change += 2.0f*PI;
-      knob += change / -7.0f;
-      if (knob < 0) knob = 0;
-      if (knob > 1) knob = 1;
+    {
+      // Make apparent brightness changes linear by squaring the
+      // value and dividing back down into range.  This gives us
+      // a gamma correction of 2.0, which is close enough.
+      unsigned short bright = (uint16_t)(knob * knob * BRT_MAX_LUMEN);
+  
+      // Avoid ever appearing off in this mode!
+      if (bright < BRT_MIN_LUMEN) bright = BRT_MIN_LUMEN;
+  
+      if((amount_current != amount_end) || abs((int16_t)(amount_end-bright)) > 4)
+        fade_to_amount(bright,100);
     }
 
-    // Make apparent brightness changes linear by squaring the
-    // value and dividing back down into range.  This gives us
-    // a gamma correction of 2.0, which is close enough.
-    unsigned short bright = (uint16_t)(knob * knob * BRT_MAX_LUMEN);
+    PT_WAIT_FOR_PERIOD(pt,50);
 
-    // Avoid ever appearing off in this mode!
-    if (bright < BRT_MIN_LUMEN) bright = BRT_MIN_LUMEN;
-
-    if((amount_current != amount_end) || abs((int16_t)(amount_end-bright)) > 4)
-      fade_to_amount(bright,100);
+    {
+      #define DEG_TO_RAD(x)    ((PI*(x))/180.0f)
+      float change = angle_roll - lastKnobAngle;
+      lastKnobAngle = angle_roll;
+  
+      // Don't bother updating our brightness reading if our angle isn't good.
+      if(abs(angle_pitch) < DEG_TO_RAD(60)) {
+        if (change >  PI) change -= 2.0f*PI;
+        if (change < -PI) change += 2.0f*PI;
+        knob += change / -7.0f;
+        if (knob < 0) knob = 0;
+        if (knob > 1) knob = 1;
+      }
+    }
   } while(amount_current && (button_pressed_duration<BUTTON_DEBOUNCE));
 
   PT_WAIT_UNTIL(pt,!button_is_pressed);
@@ -725,6 +732,52 @@ PT_THREAD(light_pt_func(struct pt *pt))
 }
 
 void
+check_serial_port(void)
+{
+  // Check the serial port
+  if(Serial.available()) {
+    char c = Serial.read();
+    switch(c) {
+    case '+':
+      if(BRT_MAX_LUMEN-amount_current<BRT_MIN_LUMEN)
+        set_amount(BRT_MAX_LUMEN);
+      else
+        set_amount(amount_current+BRT_MIN_LUMEN);
+      break;
+
+    case '-':
+      if(amount_current<BRT_MIN_LUMEN)
+        set_amount(0);
+      else
+        set_amount(amount_current-BRT_MIN_LUMEN);
+      break;
+
+    case 'X':
+    case 'x': set_amount(0); break;
+    case 'H':
+    case 'h': set_amount(BRT_MAX_LUMEN); amount_off = 0; break;
+
+    case '0': light_mode = 0; amount_off = 0; break;
+    case '1': light_mode = 1; amount_off = 0; break;
+    case '2': light_mode = 2; amount_off = 0; break;
+    case '3': light_mode = 3; amount_off = 0; break;
+    case '4': light_mode = 4; amount_off = 0; break;
+    case '5': light_mode = 5; amount_off = 0; break;
+
+    case 'R':
+      // Let the watchdog reset us.
+      Serial.println("Rebooting");
+      wdt_enable(WDTO_15MS);
+      while(1) { }
+      break;
+
+    default:
+      break;
+    }
+  }
+}
+
+void
 setup(void)
 {
   // Set our watchdog to kill us if we don't
@@ -749,10 +802,8 @@ setup(void)
   pinMode(DPIN_GLED,     OUTPUT);
   pinMode(DPIN_DRV_MODE, OUTPUT);
   pinMode(DPIN_DRV_EN,   OUTPUT);
-  pinMode(DPIN_ACC_INT,  INPUT);
   digitalWrite(DPIN_DRV_MODE, LOW);
   digitalWrite(DPIN_DRV_EN,   LOW);
-  digitalWrite(DPIN_ACC_INT,  HIGH);
   
   // Initialize serial busses
   Serial.begin(9600);
@@ -785,49 +836,12 @@ loop(void)
 
   update_loop_variables();
 
-  // Check the serial port
-  if(Serial.available()) {
-    char c = Serial.read();
-    switch(c) {
-    case '+':
-      if(BRT_MAX_LUMEN-amount_current<BRT_MIN_LUMEN)
-        set_amount(BRT_MAX_LUMEN);
-      else
-        set_amount(amount_current+BRT_MIN_LUMEN);
-      break;
-
-    case '-':
-      if(amount_current<BRT_MIN_LUMEN)
-        set_amount(0);
-      else
-        set_amount(amount_current-BRT_MIN_LUMEN);
-      break;
-
-    case 's':
-      {
-        int temperature = analogRead(APIN_TEMP);
-        Serial.print("Temperature = ");
-        Serial.println(temperature);
-
-        Serial.print("temp_current = ");
-        Serial.println(temp_current);
-
-        char accel[3];
-        readAccelFiltered(accel);
-        Serial.print("Acceleration = ");
-        Serial.print(accel[0], DEC);
-        Serial.print(", ");
-        Serial.print(accel[1], DEC);
-        Serial.print(", ");
-        Serial.println(accel[2], DEC);
-      }
-      break;
-    }
-  }
-
+  check_serial_port();
 
   button_led_pt_func(&button_led_pt);
+
   power_pt_func(&power_pt);
+
   fade_control_pt_func(&fade_control_pt);
 
 #define NUMBER_OF_MODES    (4)
@@ -840,7 +854,6 @@ loop(void)
       save_settings();
       amount_off = 0;
       save_mode = 2;
-      //fade_to_amount(0,500);
     }
   } else if((button_pressed_duration > 2048+1024+512*NUMBER_OF_MODES)) {
     amount_off = ((button_pressed_duration/64) & 1);
