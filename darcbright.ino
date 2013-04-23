@@ -48,7 +48,7 @@ If the flashlight is logo-down:
 #define VOLTAGE_NOMINAL               3330
 #define VOLTAGE_LOW                   3100
 #define OVERTEMP_SHUTDOWN_C           65
-#define OVERTEMP_THROTTLE_C           45
+#define OVERTEMP_THROTTLE_C           50
 #define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
 #define OVERTEMP_THROTTLE             (OVERTEMP_THROTTLE_C*10+500)
 #define BUTTON_BRIGHTNESS_THRESHOLD   1000 // time in ms, after which a button press turns off
