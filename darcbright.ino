@@ -47,7 +47,7 @@ If the flashlight is logo-down:
 // Settings
 #define VOLTAGE_NOMINAL               3330
 #define VOLTAGE_LOW                   3100
-#define OVERTEMP_SHUTDOWN_C           65
+#define OVERTEMP_SHUTDOWN_C           60
 #define OVERTEMP_THROTTLE_C           50
 #define OVERTEMP_SHUTDOWN             (OVERTEMP_SHUTDOWN_C*10+500)
 #define OVERTEMP_THROTTLE             (OVERTEMP_THROTTLE_C*10+500)
@@ -164,22 +164,34 @@ void
 update_loop_variables(void) {
   static char i;
 
+  // Time stamp for this loop cycle.
+  time_current = millis();
+
+  // Grab the voltage and the temperature.
   vcc_filter_table[i] = vcc_current = readVcc();
+  temp_filter_table[i] = analogRead(APIN_TEMP);
+
+  temp_current = temp_filter_table[i]*(long)vcc_current/1024;
+
   vcc_filtered = median_short(vcc_filter_table[0],vcc_filter_table[1],vcc_filter_table[2]);
 
-  temp_filter_table[i] = analogRead(APIN_TEMP);
-  temp_filtered = median_short(temp_filter_table[0],temp_filter_table[1],temp_filter_table[2])*(long)vcc_filtered/1024;
-  temp_current = temp_filter_table[i]*(long)vcc_current/1024;
+  temp_filtered *= 7;
+  temp_filtered += median_short(temp_filter_table[0],temp_filter_table[1],temp_filter_table[2])*(long)vcc_filtered/1024;
+  temp_filtered /= 8;
 
   if(++i==3)
     i=0;
 
-  time_current = millis();
+  // Read out the state of but button.
+  {
+    bool prev_value = digitalRead(DPIN_RLED_SW);
+    pinMode(DPIN_RLED_SW,  INPUT);
+    digitalWrite(DPIN_RLED_SW, 0);
+    button_is_pressed = digitalRead(DPIN_RLED_SW);
+    pinMode(DPIN_RLED_SW,  OUTPUT);
+    digitalWrite(DPIN_RLED_SW, prev_value);
+  }
 
-  bool prev_value = digitalRead(DPIN_RLED_SW);
-  pinMode(DPIN_RLED_SW,  INPUT);
-  digitalWrite(DPIN_RLED_SW, 0);
-  button_is_pressed = digitalRead(DPIN_RLED_SW);
   if(button_is_pressed) {
     button_released_time = time_current;
     button_pressed_duration = time_current - button_pressed_time;
@@ -188,8 +200,6 @@ update_loop_variables(void) {
     button_released_duration = time_current - button_released_time;
     button_pressed_duration = 0;
   }
-  pinMode(DPIN_RLED_SW,  OUTPUT);
-  digitalWrite(prev_value, 1);
 
   short chargeState = analogRead(APIN_CHARGE);
 
@@ -198,7 +208,11 @@ update_loop_variables(void) {
   } else if (chargeState > 768) {  // High - fully charged.
     batt_state = BATT_CHARGED;
   } else {  // Hi-Z - Not charging, not pulged in.
-    batt_state = BATT_DISCHARGING;
+    // But if the voltage is over 3.4 volts, then we know we are plugged in.
+    if(vcc_current>3400)
+      batt_state = BATT_CHARGING;
+    else
+      batt_state = BATT_DISCHARGING;
   }
 
   if(orientation_enabled) {
@@ -236,8 +250,10 @@ readVcc(void) {
   // Read 1.1V reference against AVcc
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
   delay(2); // Wait for Vref to settle
+  noInterrupts();
   ADCSRA |= _BV(ADSC); // Convert
   while (bit_is_set(ADCSRA,ADSC));
+  interrupts();
   result = ADCL;
   result |= ADCH<<8;
   result = 1126400L / result; // Back-calculate AVcc in mV
@@ -344,6 +360,7 @@ save_settings(void) {
 }
 
 void set_brightness(unsigned short b) {
+  noInterrupts();
   if(b<=255) {
     digitalWrite(DPIN_DRV_MODE, LOW);
     analogWrite(DPIN_DRV_EN, b);
@@ -354,6 +371,7 @@ void set_brightness(unsigned short b) {
     digitalWrite(DPIN_DRV_EN, HIGH);
     digitalWrite(DPIN_DRV_MODE, HIGH);
   }
+  interrupts();
 }
 
 void
@@ -438,15 +456,25 @@ PT_THREAD(button_led_pt_func(struct pt *pt))
         pulse = ((pulseTime>>2)&0x0100)?0xFF-pulse:pulse;
         analogWrite(DPIN_GLED, pulse);
       }
+      if(overtemp_max<BRT_MAX_LUMEN) {
+        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>0x01FF?LOW:HIGH);
+      } else {
+        digitalWrite(DPIN_RLED_SW, LOW);
+      }
       break;
     case BATT_CHARGED:
       // Solid green LED.
       digitalWrite(DPIN_GLED, HIGH);
+      if(overtemp_max<BRT_MAX_LUMEN) {
+        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>0x01FF?LOW:HIGH);
+      } else {
+        digitalWrite(DPIN_RLED_SW, LOW);
+      }
       break;
     case BATT_DISCHARGING:
       // Blink the indicator LED now and then.
       if(overtemp_max<BRT_MAX_LUMEN) {
-        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>30?LOW:HIGH);
+        digitalWrite(DPIN_RLED_SW, (time_current&0x03FF)>50?LOW:HIGH);
         digitalWrite(DPIN_GLED, LOW);
       } else {
         digitalWrite(DPIN_GLED, (time_current&0x03FF)>10?LOW:HIGH);
@@ -462,6 +490,8 @@ PT_THREAD(button_led_pt_func(struct pt *pt))
 
 PT_THREAD(power_pt_func(struct pt *pt))
 {
+  static unsigned short count;
+  count++;
   PT_BEGIN(pt);
 
   overtemp_max = BRT_MAX_LUMEN;
@@ -492,25 +522,19 @@ PT_THREAD(power_pt_func(struct pt *pt))
           overtemp_max = overtemp_max/2 + BRT_MIN_LUMEN;
           anti_flicker = 0;
         }
+      }
 
-        if(anti_flicker == 255) {
-          if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != BRT_MAX_LUMEN))
-            overtemp_max++;
-        } else {
-          anti_flicker++;
-        }
+      if(anti_flicker == 255) {
+        if((vcc_filtered > VOLTAGE_NOMINAL+50) && (overtemp_max != BRT_MAX_LUMEN))
+          overtemp_max++;
+          anti_flicker -= 10;
       } else {
-        if(anti_flicker == 255) {
-          if(overtemp_max != BRT_MAX_LUMEN)
-            overtemp_max++;
-        } else {
-          anti_flicker++;
-        }
+        anti_flicker++;
       }
 
       if(temp_filtered > OVERTEMP_THROTTLE) {
-        unsigned short new_max = ((OVERTEMP_THROTTLE+254-temp_filtered)<<2);
-        if(overtemp_max>new_max) {
+        short new_max = (256-((temp_filtered-OVERTEMP_THROTTLE)*2)<<2)-1;
+        if((overtemp_max>BRT_MIN_LUMEN) && (new_max<(signed)overtemp_max)) {
           overtemp_max--;
           anti_flicker = 0;
         }
@@ -535,6 +559,10 @@ PT_THREAD(power_pt_func(struct pt *pt))
           Serial.print(" [BATTERY]");
           break;
         }
+
+        Serial.print(" lHz=");
+        Serial.print(count);
+        count = 0;
 
         Serial.print(" duty=");
         Serial.print(amount_current);
